@@ -77,6 +77,12 @@ class ReplayStorage(Storage):
     def append(self, dataset: Dataset) -> None:
         """Appends a dataset of transitions to the storage.
 
+        (LENGTH_ROLLOUT, NUM_ENVS)
+        [{'done': tensor([], shape=NUM_ENVS)}, ...].size() == LENGTH_ROLLOUT
+
+        ->
+        (NUME_ENVS, 10_000)
+
         Args:
             dataset (Dataset): The dataset of transitions.
         """

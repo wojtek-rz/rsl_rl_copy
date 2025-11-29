@@ -2,6 +2,7 @@ import os
 import random
 import string
 import wandb
+from torch.utils.tensorboard import SummaryWriter
 
 
 def make_save_model_cb(directory):
@@ -74,6 +75,38 @@ def make_wandb_cb(init_kwargs):
             }
         )
 
+        check_complete(runner, stat)
+
+    return cb
+
+
+def make_tensorboard_cb(log_dir):
+    writer = SummaryWriter(log_dir)
+    check_complete = make_final_cb(lambda *_: writer.close())
+    
+    # Use a mutable container for the counter to allow modification in the closure
+    # We start at 0.
+    # step_counter = {"total_steps": 0}
+    iteration_counter = {"current_iteration": 0}
+
+    def cb(runner, stat):
+        mean_reward = sum(stat["returns"]) / len(stat["returns"]) if len(stat["returns"]) > 0 else 0.0
+        mean_steps = sum(stat["lengths"]) / len(stat["lengths"]) if len(stat["lengths"]) > 0 else 0.0
+        
+        # Increment steps
+        steps_this_iter = runner.env.num_envs * runner._num_steps_per_env
+        iteration_counter["current_iteration"] += 1
+        
+        training_time = stat["training_time"]
+
+        writer.add_scalar("Train/mean_reward", mean_reward, iteration_counter)
+        writer.add_scalar("Train/mean_steps", mean_steps, iteration_counter)
+        writer.add_scalar("Train/training_time", training_time, iteration_counter)
+        
+        for key, value in stat["loss"].items():
+            writer.add_scalar(f"Loss/{key}", value, iteration_counter)
+
+        writer.flush()
         check_complete(runner, stat)
 
     return cb

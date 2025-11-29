@@ -229,8 +229,8 @@ class Runner:
             "training_time": 0,
             "update_time": None,
         }
-        self._current_episode_lengths = torch.zeros(self.env.num_envs, dtype=torch.float)
-        self._current_cumulative_rewards = torch.zeros(self.env.num_envs, dtype=torch.float)
+        self._current_episode_lengths = torch.zeros(self.env.num_envs, dtype=torch.float, device="cpu")
+        self._current_cumulative_rewards = torch.zeros(self.env.num_envs, dtype=torch.float, device="cpu")
 
         self.train_mode()
 

@@ -176,7 +176,10 @@ class SAC(AbstractActorCritic):
         return self
 
     def update(self, dataset: Dataset) -> Dict[str, Union[float, torch.Tensor]]:
-        super().update(dataset)
+        # super().update(dataset)
+        with torch.inference_mode():
+            self.storage.append(self._process_dataset(dataset))
+
 
         if not self.initialized:
             return {}
@@ -187,6 +190,10 @@ class SAC(AbstractActorCritic):
         total_critic_2_loss = torch.zeros(self._batch_count)
 
         for idx, batch in enumerate(self.storage.batch_generator(self._batch_size, self._batch_count)):
+            """
+                I need a list of [(S, A, G)]
+                we get the embeddings [(sa_emb, g_emb)]
+            """
             actor_obs = batch["actor_observations"]
             critic_obs = batch["critic_observations"]
             actions = batch["actions"].reshape(-1, self._action_size)
