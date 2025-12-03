@@ -1,0 +1,33 @@
+Replay buffer implementation types:
+
+- **unroll_len**
+- **num_envs**
+- **episode length**
+- **max_replay_size**
+z
+The data is stored (max_replay_size, num_envs, <data>)
+
+The buffer sample is of shape:
+(episode_length, num_envs, <data>)
+
+The episode start is sampled from range [0 ... insert_position - episode_length),
+where insert position is the place where we insert the new transitions.
+
+insert_position can be just (max_replay_size) with circular buffer.
+
+The buffer doesn't care where one episode start and ends, but keeps the "traj_id" - trajectory id in the transition.
+
+This means that in the sampled episode there can be multiple trajectories and we have to make sure
+we sample the goal from the same trajectory.
+
+
+## Hindsigh Replay
+
+Now we have a `episode_length, num_envs` episodes.
+For each env we go through each of the episode_length starts and sample the possible goal 
+from the geometric distribution.
+
+Now we have for each env a `episode_length - 1 training pairs, in total `(episode_length - 1) * num_envs`
+pairs for the training - this step is called *flattening**.
+
+We reshape them into smaller mini batches of size batch_size. (or we could sample the batch_count of mini batches).
