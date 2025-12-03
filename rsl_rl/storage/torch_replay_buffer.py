@@ -1,14 +1,12 @@
 import torch
 from typing import Dict, Generator, List
 
-from rsl_rl.storage import Storage
-
 # prev_obs, prev_obs_info, actions, rewards, next_obs, next_obs_info, dones, data
 Transition = Dict[str, torch.Tensor]
 Dataset = List[Transition]
 
 
-class ReplayBuffer(Storage):
+class ReplayBuffer():
     def __init__(self, num_envs: int, max_replay_size: int, episode_length: int, device: str = "cpu"):
         self.num_envs = num_envs
         self.max_replay_size = max_replay_size
@@ -35,48 +33,48 @@ class ReplayBuffer(Storage):
         # Initialize buffers if this is the first insertion
         if not self.buffers:
             for key, value in first_item.items():
-                # value shape is expected to be (num_envs, *data_dim)
-                # buffer shape: (max_replay_size, num_envs, *data_dim)
                 self.buffers[key] = torch.zeros(
                     (self.max_replay_size, *value.shape),
                     dtype=value.dtype,
                     device=self.device
                 )
+            # Add traj_id buffer if dones is present
+            if 'dones' in first_item:
+                self.buffers['traj_id'] = torch.zeros(
+                    (self.max_replay_size, self.num_envs),
+                    dtype=torch.long,
+                    device=self.device
+                )
+            self.next_traj_ids = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
 
         # Stack the new data into tensors: (unroll_len, num_envs, *data_dim)
         new_data = {}
         for key in self.buffers.keys():
+            if key == 'traj_id':
+                continue
             # We assume all items in dataset have the same keys and shapes
             new_data[key] = torch.stack([item[key] for item in dataset], dim=0).to(self.device)
-            
+
+        # Calculate trajectory IDs
+        if 'dones' in new_data:
+            dones = new_data['dones'].long()
+            cumsum_dones = torch.cumsum(dones, dim=0)
+            shifted_cumsum = torch.cat([torch.zeros((1, self.num_envs), device=self.device, dtype=torch.long), cumsum_dones[:-1]], dim=0)
+            new_data['traj_id'] = self.next_traj_ids + shifted_cumsum
+            self.next_traj_ids += cumsum_dones[-1]
 
         # Check if we need to shift data to make room
         if self.insert_position + unroll_len > self.max_replay_size:
-            # The buffer is full or will overflow.
-            # We implement the shifting logic: shift data to the left, append new data at the end.
-            # Note: User specified `_data[:unroll_len] = _data[unroll_len:]` which implies a shift,
-            # but dimensionally `_data[:-unroll_len] = _data[unroll_len:]` is the correct operation
-            # to shift the tail to the head.
-            
             shift = unroll_len
-            
             for key in self.buffers:
-                # Shift existing data to the left (backwards)
-                # This overwrites the oldest data at the beginning
                 self.buffers[key][:-shift] = self.buffers[key][shift:].clone()
-                
-                # Append the new data at the end
                 self.buffers[key][-shift:] = new_data[key]
-            
-            # The buffer is now full, so insert_position stays at the end
             self.insert_position = self.max_replay_size
         else:
-            # There is enough space, just append at the current position
             for key in self.buffers:
                 self.buffers[key][self.insert_position : self.insert_position + unroll_len] = new_data[key]
-            
             self.insert_position += unroll_len
-
+    
     def batch_generator(self, batch_size: int, batch_count: int) -> Generator[Dict[str, torch.Tensor], None, None]:
         """Generates a batch of transitions.
 
