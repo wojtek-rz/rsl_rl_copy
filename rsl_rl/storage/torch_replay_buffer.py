@@ -7,14 +7,19 @@ Dataset = List[Transition]
 
 
 class ReplayBuffer():
-    def __init__(self, num_envs: int, max_replay_size: int, episode_length: int, device: str = "cpu"):
+    def __init__(self, num_envs: int, max_replay_size: int, episode_length: int, min_replay_size: int = 0, device: str = "cpu"):
         self.num_envs = num_envs
         self.max_replay_size = max_replay_size
         self.episode_length = episode_length
+        self.min_replay_size = min_replay_size
         self.device = device
 
         self.buffers = {}
         self.insert_position = 0
+
+    @property
+    def initialized(self) -> bool:
+        return self.sample_count() >= self.min_replay_size
 
     def append(self, dataset: Dataset) -> None:
         """Adds transitions to the storage.
@@ -96,7 +101,12 @@ class ReplayBuffer():
         for _ in range(batch_count):
             # 1. Select Environments
             # Sample `batch_size` environment indices randomly
-            env_idxs = torch.randint(0, self.num_envs, (batch_size,), device=self.device)
+            if batch_size < self.num_envs:
+                env_idxs = torch.randint(0, self.num_envs, (batch_size,), device=self.device)
+            elif batch_size == self.num_envs:
+                env_idxs = torch.arange(0, self.num_envs, device=self.device)
+            else:
+                raise ValueError("batch_size cannot be larger than num_envs")
 
             # 2. Select Start Times
             # The episode start is sampled from range [0 ... insert_position - episode_length)

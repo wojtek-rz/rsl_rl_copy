@@ -5,7 +5,7 @@ from typing import Any, Callable, Dict, Tuple, Union
 
 from rsl_rl.algorithms.actor_critic import AbstractActorCritic
 from rsl_rl.modules import Network, GaussianChimeraNetwork, GaussianNetwork
-from rsl_rl.storage.trajectory_storage import TrajectorySamplingStorage
+from rsl_rl.storage.torch_replay_buffer import ReplayBuffer
 from rsl_rl.storage.storage import Dataset
 
 
@@ -23,7 +23,9 @@ def similarity_matrix(sa_repr: torch.Tensor, g_repr: torch.Tensor):
     return -torch.sum(diff, dim=-1)  # (B, B)
 
 
-def info_nce_loss(sa_repr: torch.Tensor, g_repr: torch.Tensor, temp=1, version="symmetric"):
+def info_nce_loss(
+    sa_repr: torch.Tensor, g_repr: torch.Tensor, temp=1, version="symmetric"
+):
     """
     InfoNCE loss (symmetric version)
 
@@ -40,7 +42,9 @@ def info_nce_loss(sa_repr: torch.Tensor, g_repr: torch.Tensor, temp=1, version="
     match version:
         case "symmetric":
             return torch.mean(
-                2 * torch.diagonal(logits) - torch.logsumexp(logits, dim=1) - torch.logsumexp(logits, dim=0),
+                2 * torch.diagonal(logits)
+                - torch.logsumexp(logits, dim=1)
+                - torch.logsumexp(logits, dim=0),
             )
         case "forward":
             return torch.mean(torch.diagonal(logits) - torch.logsumexp(logits, dim=1))
@@ -58,12 +62,14 @@ class CRL(AbstractActorCritic):
     def __init__(
         self,
         env,
-        goal_dim: int = 2,
         repr_dim: int = 64,
+        episode_length: int = 1000,
+        min_replay_size: int = 1000,
+        max_replay_size: int = 10_000,
+        crl_loss_version: str = "symmetric",
         sa_hidden_dims: list = [256, 256],
         g_hidden_dims: list = [256, 256],
         temp: float = 1.0,
-        crl_loss_version: str = "symmetric",
         action_max: float = 1.0,
         action_min: float = -1.0,
         actor_lr: float = 1e-4,
@@ -74,37 +80,43 @@ class CRL(AbstractActorCritic):
         gradient_clip: float = 1.0,
         log_std_max: float = 4.0,
         log_std_min: float = -20.0,
-        storage_initial_size: int = 0,
-        storage_size: int = 100000,
         target_entropy: float = None,
         chimera: bool = True,
         gamma: float = 0.99,
-        **kwargs
+        **kwargs,
     ):
-        self.episode_length = kwargs.pop("episode_length", 1000)
-        super().__init__(env, action_max=action_max, action_min=action_min, gamma=gamma, **kwargs)
+        super().__init__(
+            env, action_max=action_max, action_min=action_min, gamma=gamma, **kwargs
+        )
 
-        self.goal_dim = goal_dim
+        self.episode_length = episode_length
         self.repr_dim = repr_dim
         self.temp = temp
         self.crl_loss_version = crl_loss_version
         self._gradient_clip = gradient_clip
 
-        self.storage = TrajectorySamplingStorage(
+        self.storage = ReplayBuffer(
             num_envs=self.env.num_envs,
-            max_replay_size=storage_size // self.env.num_envs, # Storage size is total transitions, we need per env
+            max_replay_size=max_replay_size,  # Storage size is total transitions, we need per env
             episode_length=self.episode_length,
-            device=self.device
+            min_replay_size=min_replay_size,
+            device=self.device,
         )
         self._register_serializable("storage")
 
-        assert self._action_max < np.inf, 'Parameter "action_max" needs to be set for CRL.'
-        assert self._action_min > -np.inf, 'Parameter "action_min" needs to be set for CRL.'
+        assert (
+            self._action_max < np.inf
+        ), 'Parameter "action_max" needs to be set for CRL.'
+        assert (
+            self._action_min > -np.inf
+        ), 'Parameter "action_min" needs to be set for CRL.'
 
         self._action_delta = 0.5 * (self._action_max - self._action_min)
         self._action_offset = 0.5 * (self._action_max + self._action_min)
 
-        self.log_alpha = torch.tensor(np.log(alpha), dtype=torch.float32).requires_grad_()
+        self.log_alpha = torch.tensor(
+            np.log(alpha), dtype=torch.float32
+        ).requires_grad_()
         self._target_entropy = target_entropy if target_entropy else -self._action_size
         self._register_serializable("log_alpha", "_gradient_clip")
 
@@ -116,49 +128,53 @@ class CRL(AbstractActorCritic):
             log_std_max=log_std_max,
             log_std_min=log_std_min,
             std_init=actor_noise_std,
-            **self._actor_network_kwargs
+            **self._actor_network_kwargs,
         )
 
         # Encoders (Critic)
-        # State-Action Encoder: (State + Action) -> Repr
-        # State dim = Obs dim - Goal dim
-        self.state_dim = self._actor_input_size - self.goal_dim
-        
+
         self.sa_encoder = Network(
-            self.state_dim + self._action_size,
+            self._actor_input_size + self._action_size,
             self.repr_dim,
             hidden_dims=sa_hidden_dims,
-            activations=["elu"] * len(sa_hidden_dims) + ["linear"]
+            activations=["elu"] * len(sa_hidden_dims) + ["linear"],
         )
-        
+
         self.g_encoder = Network(
-            self.goal_dim,
+            self._actor_input_size,
             self.repr_dim,
             hidden_dims=g_hidden_dims,
-            activations=["elu"] * len(g_hidden_dims) + ["linear"]
+            activations=["elu"] * len(g_hidden_dims) + ["linear"],
         )
 
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=actor_lr)
         self.log_alpha_optimizer = optim.Adam([self.log_alpha], lr=alpha_lr)
         self.critic_optimizer = optim.Adam(
-            list(self.sa_encoder.parameters()) + list(self.g_encoder.parameters()), 
-            lr=critic_lr
+            list(self.sa_encoder.parameters()) + list(self.g_encoder.parameters()),
+            lr=critic_lr,
         )
 
         self._register_serializable("actor", "sa_encoder", "g_encoder")
-        self._register_serializable("actor_optimizer", "log_alpha_optimizer", "critic_optimizer")
+        self._register_serializable(
+            "actor_optimizer", "log_alpha_optimizer", "critic_optimizer"
+        )
 
         # Dummy critic for AbstractActorCritic compatibility if needed
-        self.critic = self.sa_encoder 
+        self.critic = self.sa_encoder
 
     @property
     def alpha(self):
         return self.log_alpha.exp()
 
-    def draw_actions(self, obs: torch.Tensor, env_info: Dict[str, Any]) -> Tuple[torch.Tensor, Union[Dict[str, torch.Tensor], None]]:
+    def draw_actions(
+        self, obs: torch.Tensor, env_info: Dict[str, Any]
+    ) -> Tuple[torch.Tensor, Union[Dict[str, torch.Tensor], None]]:
         actor_obs, _ = self._process_observations(obs, env_info)
         action = self._sample_action(actor_obs, compute_logp=False)
-        data = {"actor_observations": actor_obs.clone(), "critic_observations": actor_obs.clone()}
+        data = {
+            "actor_observations": actor_obs.clone(),
+            "critic_observations": actor_obs.clone(),
+        }
         return action, data
 
     def get_inference_policy(self, device=None) -> Callable:
@@ -193,11 +209,86 @@ class CRL(AbstractActorCritic):
         self.g_encoder.to(device)
         self.log_alpha.to(device)
         return self
+    
+
+    def hindsight_relabel(
+        self, obs: torch.Tensor, actions: torch.Tensor, traj_ids: torch.Tensor
+    ):
+        T, B, _ = obs.shape
+        arange = torch.arange(T, device=self.device)
+        is_future_mask = (arange[:, None] < arange[None, :]).float()
+
+        discount_mat = self.gamma ** (arange[None, :] - arange[:, None]).float()  # (T, T)
+        probs = is_future_mask * discount_mat 
+        
+        # Enforce same-trajectory constraint
+        same_traj = (traj_ids[:, None, :] == traj_ids[None, :, :])  # (T, T, B)
+        same_traj = same_traj.permute(0, 2, 1).float() # -> (T, B, T)
+        # Broadcast probs to per-env shape and combine with same-traj mask
+        probs = probs[:, None, :] * same_traj # (T, B, T)
+        # Add tiny diagonal probability for numerical safety
+        probs = probs + torch.eye(T, device=self.device)[None, :, :] * 1e-5
+
+        log_probs = torch.log(probs)
+        log_probs_flat = log_probs.reshape(T * B, T)
+        goal_index_flat = torch.distributions.Categorical(logits=log_probs_flat).sample()
+        goal_index = goal_index_flat.reshape(T, B)
+
+        idx = goal_index[:-1] # (T-1, B)
+        
+        # Prepare a batch index for the environment dimension
+        b_idx = torch.arange(B, device=self.device)           # (B,)
+        # To use advanced indexing we need to expand b_idx to shape (T-1, B)
+        b_idx_expanded = b_idx.unsqueeze(0).expand(T-1, B)  # (T-1, B) 
+        # @TODO i think the exapnd here is not needed
+
+        # Then gather:
+        future_state = obs[idx, b_idx_expanded]    # (T-1, B, ObsDim)
+        future_action = actions[idx, b_idx_expanded]  # (T-1, B, ActDim)
+
+        states = obs[:-1, :] # (T-1, B, ObsDim)
+        actions = actions[:-1, :] # (T-1, B, ActDim)
+        goal = future_state # (T-1, B, ObsDim)
+
+        assert states.shape == goal.shape
+
+        return states, actions, future_state
+
+    def make_batches(self, obs, actions, goals, batch_size):
+        """
+        obs:     (T-1, B, ObsDim)
+        actions: (T-1, B, ActDim)
+        goals:   (T-1, B, ObsDim)
+        """
+        Tm1, B = obs.shape[:2]
+        N = Tm1 * B    # total transitions
+
+        # Flatten time and env dims
+        obs_flat = obs.reshape(N, -1)        # (N, ObsDim)
+        actions_flat = actions.reshape(N, -1)  # (N, ActDim)
+        goals_flat = goals.reshape(N, -1)    # (N, ObsDim)
+
+        # Shuffle indices
+        idx = torch.randperm(N, device=obs.device)
+
+        obs_flat = obs_flat[idx]
+        actions_flat = actions_flat[idx]
+        goals_flat = goals_flat[idx]
+
+        # Create batches
+        batches = []
+        for i in range(0, N, batch_size):
+            batches.append((
+                obs_flat[i : i + batch_size],
+                actions_flat[i : i + batch_size],
+                goals_flat[i : i + batch_size],
+            ))
+
+        return batches
 
     def update(self, dataset: Dataset) -> Dict[str, Union[float, torch.Tensor]]:
-        breakpoint()
-
         self.storage.append(dataset)
+
         if not self.initialized:
             return {}
 
@@ -205,152 +296,52 @@ class CRL(AbstractActorCritic):
         total_alpha_loss = []
         total_critic_loss = []
 
-        # We perform updates based on batch_count, sampling trajectories each time
-        for _ in range(self._batch_count):
-            # Sample trajectories: (num_envs, episode_length, ...)
-            trajectories = self.storage.sample_trajectories()
-            
-            # Flatten trajectories for processing if needed, or process as batch
-            # JAX implementation flattens and then creates contrastive pairs.
-            # Here we have (N, L, D).
-            
-            # We need to construct positive and negative pairs.
-            # Positive pairs: (s_t, a_t) and g_t (where g_t is from the future of the same trajectory)
-            # Negative pairs: (s_t, a_t) and g' (from other trajectories or other times)
-            
-            # Let's implement the logic from JAX `flatten_batch` roughly.
-            # It samples a future goal for each timestep.
-            
-            
-            obs = trajectories["actor_observations"] # (N, L, ObsDim)
-            actions = trajectories["actions"] # (N, L, ActDim)
-            dones = trajectories["dones"] # (N, L)
-            
-            state = obs[..., :self.state_dim] # (N, L, StateDim)
-            
-            # Sample future goals
-            # For each t in [0, L-1], sample k > t.
-            # We can vectorize this.
-            
-            N, L, _ = state.shape
-            
-            states_list = []
-            actions_list = []
-            goals_list = []
+        trajectories = self.storage.batch_generator(batch_size=self.env.num_envs, batch_count=1).__next__()
 
-            # Precompute cumulative dones for fast range checking
-            # cum_dones[n, t] = sum(dones[n, 0..t])
-            cum_dones = torch.cumsum(dones.float(), dim=1)
-            
-            for t in range(L - 1):
-                # Current state/action at time t across all N envs
-                s_t = state[:, t]
-                a_t = actions[:, t]
-                
-                range_size = L - 1 - t
-                
-                # Geometric distribution sampling
-                # P(offset=k) \propto gamma^k for k in 1..range_size
-                probs = self.gamma ** torch.arange(1, range_size + 1, device=self.device)
-                probs = probs / probs.sum()
-                
-                # Sample offsets
-                offsets = torch.multinomial(probs, num_samples=N, replacement=True)
-                # offsets are 0-indexed, so add 1
-                offsets = offsets + 1
-                
-                k = t + offsets
-                
-                g_t = state[torch.arange(N, device=self.device), k]
-                
-                g_t = g_t[:, :self.goal_dim]
+        obs = trajectories["prev_obs"]  # (episode_length, batch_size, ObsDim)
+        actions = trajectories["actions"]  # (episode_length, batch_size, ActDim)
+        traj_ids = trajectories["traj_id"]  # (episode_length, batch_size)
 
-                # Check for dones in range [t, k-1]
-                # If done occurred at step i, then transition i -> i+1 is invalid.
-                # So if any done in [t, k-1] is 1, then the path from t to k crosses a reset.
-                
-                end_idx = k - 1
-                start_idx = t - 1
-                
-                val_end = cum_dones[torch.arange(N, device=self.device), end_idx]
-                if start_idx >= 0:
-                    val_start = cum_dones[:, start_idx]
-                else:
-                    val_start = torch.zeros(N, device=self.device)
-                    
-                has_done = (val_end - val_start) > 0.5 # Use 0.5 threshold for float comparison
-                valid_mask = ~has_done
-                
-                if valid_mask.sum() > 0:
-                    states_list.append(s_t[valid_mask])
-                    actions_list.append(a_t[valid_mask])
-                    goals_list.append(g_t[valid_mask])
-                
-            # Concatenate to create batch
-            if len(states_list) > 0:
-                batch_state = torch.cat(states_list, dim=0) # (TotalValid, StateDim)
-                batch_actions = torch.cat(actions_list, dim=0) # (TotalValid, ActDim)
-                batch_goals = torch.cat(goals_list, dim=0) # (TotalValid, GoalDim)
-            else:
-                return {}
-            
-            # Now we have a large batch. We can subsample it to `batch_size` if it's too big,
-            # or just use it all if memory allows.
-            # JAX code uses `batch_size`.
-            
-            total_samples = batch_state.shape[0]
-            indices = torch.randperm(total_samples, device=self.device)[:self._batch_size]
-            
-            b_state = batch_state[indices]
-            b_actions = batch_actions[indices]
-            b_goals = batch_goals[indices]
+        states, actions, goals = self.hindsight_relabel(obs, actions, traj_ids)
+
+        for b_state, b_actions, b_goals in self.make_batches(states, actions, goals, self._batch_size):
 
             # --- Update Critic (Encoders) ---
             sa_repr = self.sa_encoder(torch.cat([b_state, b_actions], dim=-1))
             g_repr = self.g_encoder(b_goals)
-            
+
             # InfoNCE Loss
-            crl_loss = -info_nce_loss(sa_repr, g_repr, temp=self.temp, version=self.crl_loss_version)
-            
+            crl_loss = -info_nce_loss(
+                sa_repr, g_repr, temp=self.temp, version=self.crl_loss_version
+            )
+
             self.critic_optimizer.zero_grad()
+            
             crl_loss.backward()
+
             nn.utils.clip_grad_norm_(self.sa_encoder.parameters(), self._gradient_clip)
             nn.utils.clip_grad_norm_(self.g_encoder.parameters(), self._gradient_clip)
             self.critic_optimizer.step()
+            
 
-            # --- Update Actor and Alpha ---
-            # We need observations for the actor.
-            # The actor takes `obs` which is usually [state, goal].
-            # Here `b_state` is the state. `b_goals` is the goal we are trying to reach.
-            # So we construct actor input as cat([b_state, b_goals]).
+            # --- Update Actor ---
+            actor_obs = torch.cat([b_state, b_goals], dim=-1)
+            new_actions, log_prob = self._sample_action(actor_obs, compute_logp=True)
             
-            # Note: In the original code, `obs` from env already has a goal.
-            # But in GCRL, we are training the actor to reach *any* goal (the sampled future goal).
-            # So we should replace the goal in `obs` with `b_goals`.
-            
-            # Construct actor input
-            actor_input = torch.cat([b_state, b_goals], dim=-1)
-            
-            # Sample action
-            pred_actions, pred_logp = self._sample_action(actor_input)
-            
-            # Compute representations for actor loss
-            sa_repr_pi = self.sa_encoder(torch.cat([b_state, pred_actions], dim=-1))
+            sa_repr_pi = self.sa_encoder(torch.cat([b_state, new_actions], dim=-1))
             g_repr_pi = self.g_encoder(b_goals)
             
-            # Similarity (Energy)
-            sim_pi = -torch.sum((sa_repr_pi - g_repr_pi)**2, dim=-1)
+            # Q-value (Energy)
+            qf_pi = -torch.sum((sa_repr_pi - g_repr_pi) ** 2, dim=-1)
             
-            # Actor Loss
-            actor_loss = (self.alpha.detach() * pred_logp - sim_pi).mean()
+            actor_loss = (self.alpha.detach() * log_prob - qf_pi).mean()
             
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
-            nn.utils.clip_grad_norm_(self.actor.parameters(), self._gradient_clip)
             self.actor_optimizer.step()
             
-            # Alpha update
-            alpha_loss = -(self.log_alpha * (pred_logp + self._target_entropy).detach()).mean()
+            # --- Update Alpha ---
+            alpha_loss = (self.alpha * (-log_prob - self._target_entropy).detach()).mean()
             
             self.log_alpha_optimizer.zero_grad()
             alpha_loss.backward()
@@ -363,19 +354,23 @@ class CRL(AbstractActorCritic):
         return {
             "actor": np.mean(total_actor_loss),
             "alpha": np.mean(total_alpha_loss),
-            "critic": np.mean(total_critic_loss)
+            "critic": np.mean(total_critic_loss),
         }
 
     def _sample_action(self, observation, compute_logp=True):
         mean, std = self.actor.forward(observation, compute_std=True)
         dist = torch.distributions.Normal(mean, std)
         actions = dist.rsample()
-        actions_normalized, actions_scaled = self._scale_actions(actions, intermediate=True)
-        
+        actions_normalized, actions_scaled = self._scale_actions(
+            actions, intermediate=True
+        )
+
         if not compute_logp:
             return actions_scaled
-            
-        action_logp = dist.log_prob(actions).sum(-1) - torch.log(1.0 - actions_normalized.pow(2) + 1e-6).sum(-1)
+
+        action_logp = dist.log_prob(actions).sum(-1) - torch.log(
+            1.0 - actions_normalized.pow(2) + 1e-6
+        ).sum(-1)
         return actions_scaled, action_logp
 
     def _scale_actions(self, actions, intermediate=False):
@@ -385,6 +380,6 @@ class CRL(AbstractActorCritic):
         if intermediate:
             return action_normalized, action_scaled
         return action_scaled
-    
+
     def register_terminations(self, terminations):
         pass
