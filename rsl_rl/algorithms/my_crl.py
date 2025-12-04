@@ -227,7 +227,7 @@ class CRL(AbstractActorCritic):
         # Broadcast probs to per-env shape and combine with same-traj mask
         probs = probs[:, None, :] * same_traj # (T, B, T)
         # Add tiny diagonal probability for numerical safety
-        probs = probs + torch.eye(T, device=self.device)[None, :, :] * 1e-5
+        probs = probs + torch.eye(T, device=self.device)[:, None, :] * 1e-5
 
         log_probs = torch.log(probs)
         log_probs_flat = log_probs.reshape(T * B, T)
@@ -296,60 +296,65 @@ class CRL(AbstractActorCritic):
         total_alpha_loss = []
         total_critic_loss = []
 
-        trajectories = self.storage.batch_generator(batch_size=self.env.num_envs, batch_count=1).__next__()
+        for trajectories in self.storage.batch_generator(batch_size=self.env.num_envs, batch_count=1):
+            # break
+            obs = trajectories["actor_observations"]  # (episode_length, batch_size, ObsDim)
+            actions = trajectories["actions"]  # (episode_length, batch_size, ActDim)
+            traj_ids = trajectories["traj_id"]  # (episode_length, batch_size)
+            from torch.profiler import profile, record_function, ProfilerActivity
 
-        obs = trajectories["prev_obs"]  # (episode_length, batch_size, ObsDim)
-        actions = trajectories["actions"]  # (episode_length, batch_size, ActDim)
-        traj_ids = trajectories["traj_id"]  # (episode_length, batch_size)
+            with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], profile_memory=True, record_shapes=True) as prof:
+                states, actions, goals = self.hindsight_relabel(obs, actions, traj_ids)
+            print(prof.key_averages().table(sort_by="cuda_memory_usage", row_limit=10))
 
-        states, actions, goals = self.hindsight_relabel(obs, actions, traj_ids)
+            states, actions, goals = self.hindsight_relabel(obs, actions, traj_ids)
 
-        for b_state, b_actions, b_goals in self.make_batches(states, actions, goals, self._batch_size):
+            for b_state, b_actions, b_goals in self.make_batches(states, actions, goals, self._batch_size):
 
-            # --- Update Critic (Encoders) ---
-            sa_repr = self.sa_encoder(torch.cat([b_state, b_actions], dim=-1))
-            g_repr = self.g_encoder(b_goals)
+                # --- Update Critic (Encoders) ---
+                sa_repr = self.sa_encoder(torch.cat([b_state, b_actions], dim=-1))
+                g_repr = self.g_encoder(b_goals)
 
-            # InfoNCE Loss
-            crl_loss = -info_nce_loss(
-                sa_repr, g_repr, temp=self.temp, version=self.crl_loss_version
-            )
+                # InfoNCE Loss
+                crl_loss = -info_nce_loss(
+                    sa_repr, g_repr, temp=self.temp, version=self.crl_loss_version
+                )
 
-            self.critic_optimizer.zero_grad()
-            
-            crl_loss.backward()
+                self.critic_optimizer.zero_grad()
+                
+                crl_loss.backward()
 
-            nn.utils.clip_grad_norm_(self.sa_encoder.parameters(), self._gradient_clip)
-            nn.utils.clip_grad_norm_(self.g_encoder.parameters(), self._gradient_clip)
-            self.critic_optimizer.step()
-            
+                nn.utils.clip_grad_norm_(self.sa_encoder.parameters(), self._gradient_clip)
+                nn.utils.clip_grad_norm_(self.g_encoder.parameters(), self._gradient_clip)
+                self.critic_optimizer.step()
+                
 
-            # --- Update Actor ---
-            actor_obs = torch.cat([b_state, b_goals], dim=-1)
-            new_actions, log_prob = self._sample_action(actor_obs, compute_logp=True)
-            
-            sa_repr_pi = self.sa_encoder(torch.cat([b_state, new_actions], dim=-1))
-            g_repr_pi = self.g_encoder(b_goals)
-            
-            # Q-value (Energy)
-            qf_pi = -torch.sum((sa_repr_pi - g_repr_pi) ** 2, dim=-1)
-            
-            actor_loss = (self.alpha.detach() * log_prob - qf_pi).mean()
-            
-            self.actor_optimizer.zero_grad()
-            actor_loss.backward()
-            self.actor_optimizer.step()
-            
-            # --- Update Alpha ---
-            alpha_loss = (self.alpha * (-log_prob - self._target_entropy).detach()).mean()
-            
-            self.log_alpha_optimizer.zero_grad()
-            alpha_loss.backward()
-            self.log_alpha_optimizer.step()
+                # --- Update Actor ---
+                actor_obs = torch.cat([b_state, b_goals], dim=-1)
+                new_actions, log_prob = self._sample_action(actor_obs, compute_logp=True)
+                
+                sa_repr_pi = self.sa_encoder(torch.cat([b_state, new_actions], dim=-1))
+                g_repr_pi = self.g_encoder(b_goals)
+                
+                # Q-value (Energy)
+                qf_pi = -torch.sum((sa_repr_pi - g_repr_pi) ** 2, dim=-1)
+                
+                actor_loss = (self.alpha.detach() * log_prob - qf_pi).mean()
+                
+                self.actor_optimizer.zero_grad()
+                actor_loss.backward()
+                self.actor_optimizer.step()
+                
+                # --- Update Alpha ---
+                alpha_loss = (self.alpha * (-log_prob - self._target_entropy).detach()).mean()
+                
+                self.log_alpha_optimizer.zero_grad()
+                alpha_loss.backward()
+                self.log_alpha_optimizer.step()
 
-            total_actor_loss.append(actor_loss.item())
-            total_alpha_loss.append(alpha_loss.item())
-            total_critic_loss.append(crl_loss.item())
+                total_actor_loss.append(actor_loss.item())
+                total_alpha_loss.append(alpha_loss.item())
+                total_critic_loss.append(crl_loss.item())
 
         return {
             "actor": np.mean(total_actor_loss),

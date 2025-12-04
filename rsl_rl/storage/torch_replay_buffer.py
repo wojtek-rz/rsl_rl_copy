@@ -1,7 +1,8 @@
 import torch
 from typing import Dict, Generator, List
 
-# prev_obs, prev_obs_info, actions, rewards, next_obs, next_obs_info, dones, data
+# dict_keys(['actions', 'actor_observations', 'critic_observations', 'dones', 'next_actor_observations', 'next_critic_observations', 'rewards', 'timeouts'])
+
 Transition = Dict[str, torch.Tensor]
 Dataset = List[Transition]
 
@@ -19,7 +20,7 @@ class ReplayBuffer():
 
     @property
     def initialized(self) -> bool:
-        return self.sample_count() >= self.min_replay_size
+        return self.insert_position >= self.episode_length and self.sample_count >= self.min_replay_size
 
     def append(self, dataset: Dataset) -> None:
         """Adds transitions to the storage.
@@ -137,6 +138,7 @@ class ReplayBuffer():
 
             yield batch
 
+    @property
     def sample_count(self) -> int:
         """Returns how many individual time-steps are stored in the storage."""
         return self.insert_position * self.num_envs
