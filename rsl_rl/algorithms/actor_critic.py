@@ -228,7 +228,7 @@ class AbstractActorCritic(Agent):
             next_actor_obs, next_critic_obs = data["next_actor_observations"], data["next_critic_observations"]
         else:
             next_actor_obs, next_critic_obs = self._process_observations(next_observations, next_environment_info)
-
+        
         transition = {
             "actions": actions,
             "actor_observations": actor_obs,

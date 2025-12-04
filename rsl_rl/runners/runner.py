@@ -295,6 +295,7 @@ class Runner:
 
         next_obs, rewards, dones, next_env_info = self.env.step(actions)
 
+
         self._dataset.append(
             self.agent.process_transition(
                 self._obs.clone(),

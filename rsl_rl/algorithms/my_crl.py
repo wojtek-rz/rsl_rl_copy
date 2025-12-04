@@ -82,6 +82,7 @@ class CRL(AbstractActorCritic):
         log_std_max: float = 4.0,
         log_std_min: float = -20.0,
         target_entropy: float = None,
+        logsumexp_penalty: float = 0.1,
         chimera: bool = True,
         gamma: float = 0.99,
         **kwargs,
@@ -91,7 +92,6 @@ class CRL(AbstractActorCritic):
             action_max=action_max,
             action_min=action_min,
             gamma=gamma,
-            _actor_input_size_delta=goal_dim,
             **kwargs,
         )
 
@@ -100,6 +100,7 @@ class CRL(AbstractActorCritic):
         self.temp = temp
         self.crl_loss_version = crl_loss_version
         self._gradient_clip = gradient_clip
+        self._logsumexp_penalty = logsumexp_penalty
 
         self.storage = ReplayBuffer(
             num_envs=self.env.num_envs,
@@ -176,11 +177,12 @@ class CRL(AbstractActorCritic):
     def draw_actions(
         self, obs: torch.Tensor, env_info: Dict[str, Any]
     ) -> Tuple[torch.Tensor, Union[Dict[str, torch.Tensor], None]]:
+        # breakpoint()
         actor_obs, critic_obs = self._process_observations(obs, env_info)
         action = self._sample_action(actor_obs, compute_logp=False)
         data = {
             "actor_observations": actor_obs.clone(),
-            "critic_observations": actor_obs.clone(),
+            "critic_observations": critic_obs.clone(),
         }
         return action, data
 
@@ -217,6 +219,7 @@ class CRL(AbstractActorCritic):
         self.log_alpha.to(device)
         return self
 
+
     def hindsight_relabel(
         self, obs: torch.Tensor, actions: torch.Tensor, traj_ids: torch.Tensor
     ):
@@ -224,13 +227,11 @@ class CRL(AbstractActorCritic):
         arange = torch.arange(T, device=self.device)
         is_future_mask = (arange[:, None] < arange[None, :]).float()
 
-        discount_mat = (
-            self.gamma ** (arange[None, :] - arange[:, None]).float()
-        )  # (T, T)
+        discount_mat = self.gamma ** (arange[None, :] - arange[:, None]).float()  # (T, T)
         base_probs = is_future_mask * discount_mat  # (T, T)
-
+        
         goal_indices = []
-        chunk_size = 64  # Process environments in chunks to save memory
+        chunk_size = 100  # Process environments in chunks to save memory
 
         for i in range(0, B, chunk_size):
             # Slice traj_ids for the current chunk
@@ -239,52 +240,81 @@ class CRL(AbstractActorCritic):
 
             # Enforce same-trajectory constraint
             # (T, 1, chunk_B) == (1, T, chunk_B) -> (T, T, chunk_B)
-            same_traj_chunk = traj_ids_chunk[:, None, :] == traj_ids_chunk[None, :, :]
-            same_traj_chunk = same_traj_chunk.permute(
-                0, 2, 1
-            ).float()  # -> (T, chunk_B, T)
+            same_traj_chunk = (traj_ids_chunk[:, None, :] == traj_ids_chunk[None, :, :])
+            same_traj_chunk = same_traj_chunk.permute(0, 2, 1).float()  # -> (T, chunk_B, T)
 
             # Broadcast base_probs to chunk shape and combine
             # base_probs is (T, T) -> (T, 1, T)
             probs_chunk = base_probs[:, None, :] * same_traj_chunk  # (T, chunk_B, T)
-
+            
             # Add tiny diagonal probability
-            probs_chunk = (
-                probs_chunk + torch.eye(T, device=self.device)[:, None, :] * 1e-5
-            )
+            probs_chunk = probs_chunk + torch.eye(T, device=self.device)[:, None, :] * 1e-5
 
             log_probs_chunk = torch.log(probs_chunk)
             # Flatten for Categorical: (T * chunk_B, T)
             log_probs_flat = log_probs_chunk.reshape(T * chunk_B, T)
-
-            goal_index_flat = torch.distributions.Categorical(
-                logits=log_probs_flat
-            ).sample()
+            
+            goal_index_flat = torch.distributions.Categorical(logits=log_probs_flat).sample()
             goal_index_chunk = goal_index_flat.reshape(T, chunk_B)
             goal_indices.append(goal_index_chunk)
 
         goal_index = torch.cat(goal_indices, dim=1)  # (T, B)
 
         idx = goal_index[:-1]  # (T-1, B)
-
+        
         # Prepare a batch index for the environment dimension
-        b_idx = torch.arange(B, device=self.device)  # (B,)
-        b_idx_expanded = b_idx.unsqueeze(0).expand(T - 1, B)  # (T-1, B)
+        b_idx = torch.arange(B, device=self.device)           # (B,)
+        b_idx_expanded = b_idx.unsqueeze(0).expand(T-1, B)  # (T-1, B) 
 
         # Then gather:
-        future_state = obs[idx, b_idx_expanded]  # (T-1, B, ObsDim)
+        future_state = obs[idx, b_idx_expanded]    # (T-1, B, ObsDim)
 
         states = obs[:-1, :]  # (T-1, B, ObsDim)
         actions = actions[:-1, :]  # (T-1, B, ActDim)
-        
-        if self.goal_indices is not None:
-            goal = future_state[..., self.goal_indices] # (T-1, B, GoalDim)
-        else:
-            goal = future_state  # (T-1, B, ObsDim)
+        goals = future_state[..., self.env.goal_indices]  # (T-1, B, Goaldim)
 
-        assert states.shape[0] == goal.shape[0]
+        return states, actions, goals
+    
+    def hindsight_relabel_memory_consuming(
+        self, obs: torch.Tensor, actions: torch.Tensor, traj_ids: torch.Tensor
+    ):
+        T, B, _ = obs.shape
+        arange = torch.arange(T, device=self.device)
+        is_future_mask = (arange[:, None] < arange[None, :]).float()
 
-        return states, actions, goal
+        discount_mat = self.gamma ** (arange[None, :] - arange[:, None]).float()  # (T, T)
+        probs = is_future_mask * discount_mat 
+
+        # Enforce same-trajectory constraint
+        same_traj = (traj_ids[:, None, :] == traj_ids[None, :, :])  # (T, T, B)
+        same_traj = same_traj.permute(0, 2, 1).float() # -> (T, B, T)
+        # Broadcast probs to per-env shape and combine with same-traj mask
+        probs = probs[:, None, :] * same_traj # (T, B, T)
+        # Add tiny diagonal probability for numerical safety
+        probs = probs + torch.eye(T, device=self.device)[:, None, :] * 1e-5
+
+        log_probs = torch.log(probs)
+        log_probs_flat = log_probs.reshape(T * B, T)
+        goal_index_flat = torch.distributions.Categorical(logits=log_probs_flat).sample()
+        goal_index = goal_index_flat.reshape(T, B)
+
+        idx = goal_index[:-1] # (T-1, B)
+
+        # Prepare a batch index for the environment dimension
+        b_idx = torch.arange(B, device=self.device)           # (B,)
+        # To use advanced indexing we need to expand b_idx to shape (T-1, B)
+        b_idx_expanded = b_idx.unsqueeze(0).expand(T-1, B)  # (T-1, B) 
+
+        # Then gather:
+        future_state = obs[idx, b_idx_expanded]    # (T-1, B, ObsDim)
+        future_action = actions[idx, b_idx_expanded]  # (T-1, B, ActDim)
+
+        states = obs[:-1, :] # (T-1, B, ObsDim)
+        actions = actions[:-1, :] # (T-1, B, ActDim)
+        goal = future_state[:, self.env.goal_indices] # (T-1, B, GoalDIm)
+
+
+        return states, actions, future_state
 
     def make_batches(self, obs, actions, goals, batch_size):
         """
@@ -354,6 +384,12 @@ class CRL(AbstractActorCritic):
                 crl_loss = -info_nce_loss(
                     sa_repr, g_repr, temp=self.temp, version=self.crl_loss_version
                 )
+
+                # Logsumexp penalty
+                if self._logsumexp_penalty > 0:
+                    logits = similarity_matrix(sa_repr, g_repr) / self.temp
+                    logsumexp = torch.logsumexp(logits + 1e-6, dim=1)
+                    crl_loss = crl_loss + self._logsumexp_penalty * torch.mean(logsumexp ** 2)
 
                 self.critic_optimizer.zero_grad()
 
