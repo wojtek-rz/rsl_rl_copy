@@ -219,36 +219,50 @@ class CRL(AbstractActorCritic):
         is_future_mask = (arange[:, None] < arange[None, :]).float()
 
         discount_mat = self.gamma ** (arange[None, :] - arange[:, None]).float()  # (T, T)
-        probs = is_future_mask * discount_mat 
+        base_probs = is_future_mask * discount_mat  # (T, T)
         
-        # Enforce same-trajectory constraint
-        same_traj = (traj_ids[:, None, :] == traj_ids[None, :, :])  # (T, T, B)
-        same_traj = same_traj.permute(0, 2, 1).float() # -> (T, B, T)
-        # Broadcast probs to per-env shape and combine with same-traj mask
-        probs = probs[:, None, :] * same_traj # (T, B, T)
-        # Add tiny diagonal probability for numerical safety
-        probs = probs + torch.eye(T, device=self.device)[:, None, :] * 1e-5
+        goal_indices = []
+        chunk_size = 64  # Process environments in chunks to save memory
 
-        log_probs = torch.log(probs)
-        log_probs_flat = log_probs.reshape(T * B, T)
-        goal_index_flat = torch.distributions.Categorical(logits=log_probs_flat).sample()
-        goal_index = goal_index_flat.reshape(T, B)
+        for i in range(0, B, chunk_size):
+            # Slice traj_ids for the current chunk
+            traj_ids_chunk = traj_ids[:, i : i + chunk_size]  # (T, chunk_B)
+            chunk_B = traj_ids_chunk.shape[1]
 
-        idx = goal_index[:-1] # (T-1, B)
+            # Enforce same-trajectory constraint
+            # (T, 1, chunk_B) == (1, T, chunk_B) -> (T, T, chunk_B)
+            same_traj_chunk = (traj_ids_chunk[:, None, :] == traj_ids_chunk[None, :, :])
+            same_traj_chunk = same_traj_chunk.permute(0, 2, 1).float()  # -> (T, chunk_B, T)
+
+            # Broadcast base_probs to chunk shape and combine
+            # base_probs is (T, T) -> (T, 1, T)
+            probs_chunk = base_probs[:, None, :] * same_traj_chunk  # (T, chunk_B, T)
+            
+            # Add tiny diagonal probability
+            probs_chunk = probs_chunk + torch.eye(T, device=self.device)[:, None, :] * 1e-5
+
+            log_probs_chunk = torch.log(probs_chunk)
+            # Flatten for Categorical: (T * chunk_B, T)
+            log_probs_flat = log_probs_chunk.reshape(T * chunk_B, T)
+            
+            goal_index_flat = torch.distributions.Categorical(logits=log_probs_flat).sample()
+            goal_index_chunk = goal_index_flat.reshape(T, chunk_B)
+            goal_indices.append(goal_index_chunk)
+
+        goal_index = torch.cat(goal_indices, dim=1)  # (T, B)
+
+        idx = goal_index[:-1]  # (T-1, B)
         
         # Prepare a batch index for the environment dimension
         b_idx = torch.arange(B, device=self.device)           # (B,)
-        # To use advanced indexing we need to expand b_idx to shape (T-1, B)
         b_idx_expanded = b_idx.unsqueeze(0).expand(T-1, B)  # (T-1, B) 
-        # @TODO i think the exapnd here is not needed
 
         # Then gather:
         future_state = obs[idx, b_idx_expanded]    # (T-1, B, ObsDim)
-        future_action = actions[idx, b_idx_expanded]  # (T-1, B, ActDim)
 
-        states = obs[:-1, :] # (T-1, B, ObsDim)
-        actions = actions[:-1, :] # (T-1, B, ActDim)
-        goal = future_state # (T-1, B, ObsDim)
+        states = obs[:-1, :]  # (T-1, B, ObsDim)
+        actions = actions[:-1, :]  # (T-1, B, ActDim)
+        goal = future_state  # (T-1, B, ObsDim)
 
         assert states.shape == goal.shape
 
@@ -301,11 +315,6 @@ class CRL(AbstractActorCritic):
             obs = trajectories["actor_observations"]  # (episode_length, batch_size, ObsDim)
             actions = trajectories["actions"]  # (episode_length, batch_size, ActDim)
             traj_ids = trajectories["traj_id"]  # (episode_length, batch_size)
-            from torch.profiler import profile, record_function, ProfilerActivity
-
-            with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], profile_memory=True, record_shapes=True) as prof:
-                states, actions, goals = self.hindsight_relabel(obs, actions, traj_ids)
-            print(prof.key_averages().table(sort_by="cuda_memory_usage", row_limit=10))
 
             states, actions, goals = self.hindsight_relabel(obs, actions, traj_ids)
 
