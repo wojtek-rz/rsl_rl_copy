@@ -123,7 +123,7 @@ class CRL(AbstractActorCritic):
         # Actor Network
         network_class = GaussianChimeraNetwork if chimera else GaussianNetwork
         self.actor = network_class(
-            self._actor_input_size,
+            self._actor_input_size + self._actor_input_size,
             self._action_size,
             log_std_max=log_std_max,
             log_std_min=log_std_min,
@@ -339,6 +339,7 @@ class CRL(AbstractActorCritic):
                 
 
                 # --- Update Actor ---
+                # actor_obs = torch.cat([b_state, b_goals], dim=-1)
                 actor_obs = torch.cat([b_state, b_goals], dim=-1)
                 new_actions, log_prob = self._sample_action(actor_obs, compute_logp=True)
                 
