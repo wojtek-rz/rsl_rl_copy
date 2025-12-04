@@ -63,6 +63,7 @@ class CRL(AbstractActorCritic):
         self,
         env,
         repr_dim: int = 64,
+        goal_dim: int = 2,
         episode_length: int = 1000,
         min_replay_size: int = 1000,
         max_replay_size: int = 10_000,
@@ -86,7 +87,12 @@ class CRL(AbstractActorCritic):
         **kwargs,
     ):
         super().__init__(
-            env, action_max=action_max, action_min=action_min, gamma=gamma, **kwargs
+            env,
+            action_max=action_max,
+            action_min=action_min,
+            gamma=gamma,
+            _actor_input_size_delta=goal_dim,
+            **kwargs,
         )
 
         self.episode_length = episode_length
@@ -123,7 +129,7 @@ class CRL(AbstractActorCritic):
         # Actor Network
         network_class = GaussianChimeraNetwork if chimera else GaussianNetwork
         self.actor = network_class(
-            self._actor_input_size + self._actor_input_size,
+            self._actor_input_size,
             self._action_size,
             log_std_max=log_std_max,
             log_std_min=log_std_min,
@@ -132,16 +138,17 @@ class CRL(AbstractActorCritic):
         )
 
         # Encoders (Critic)
+        print(f"{self._critic_input_size=}, {self._actor_input_size=}")
 
         self.sa_encoder = Network(
-            self._actor_input_size + self._action_size,
+            self._critic_input_size,
             self.repr_dim,
             hidden_dims=sa_hidden_dims,
             activations=["elu"] * len(sa_hidden_dims) + ["linear"],
         )
 
         self.g_encoder = Network(
-            self._actor_input_size,
+            goal_dim,
             self.repr_dim,
             hidden_dims=g_hidden_dims,
             activations=["elu"] * len(g_hidden_dims) + ["linear"],
@@ -169,7 +176,7 @@ class CRL(AbstractActorCritic):
     def draw_actions(
         self, obs: torch.Tensor, env_info: Dict[str, Any]
     ) -> Tuple[torch.Tensor, Union[Dict[str, torch.Tensor], None]]:
-        actor_obs, _ = self._process_observations(obs, env_info)
+        actor_obs, critic_obs = self._process_observations(obs, env_info)
         action = self._sample_action(actor_obs, compute_logp=False)
         data = {
             "actor_observations": actor_obs.clone(),
@@ -209,7 +216,6 @@ class CRL(AbstractActorCritic):
         self.g_encoder.to(device)
         self.log_alpha.to(device)
         return self
-    
 
     def hindsight_relabel(
         self, obs: torch.Tensor, actions: torch.Tensor, traj_ids: torch.Tensor
@@ -218,9 +224,11 @@ class CRL(AbstractActorCritic):
         arange = torch.arange(T, device=self.device)
         is_future_mask = (arange[:, None] < arange[None, :]).float()
 
-        discount_mat = self.gamma ** (arange[None, :] - arange[:, None]).float()  # (T, T)
+        discount_mat = (
+            self.gamma ** (arange[None, :] - arange[:, None]).float()
+        )  # (T, T)
         base_probs = is_future_mask * discount_mat  # (T, T)
-        
+
         goal_indices = []
         chunk_size = 64  # Process environments in chunks to save memory
 
@@ -231,42 +239,52 @@ class CRL(AbstractActorCritic):
 
             # Enforce same-trajectory constraint
             # (T, 1, chunk_B) == (1, T, chunk_B) -> (T, T, chunk_B)
-            same_traj_chunk = (traj_ids_chunk[:, None, :] == traj_ids_chunk[None, :, :])
-            same_traj_chunk = same_traj_chunk.permute(0, 2, 1).float()  # -> (T, chunk_B, T)
+            same_traj_chunk = traj_ids_chunk[:, None, :] == traj_ids_chunk[None, :, :]
+            same_traj_chunk = same_traj_chunk.permute(
+                0, 2, 1
+            ).float()  # -> (T, chunk_B, T)
 
             # Broadcast base_probs to chunk shape and combine
             # base_probs is (T, T) -> (T, 1, T)
             probs_chunk = base_probs[:, None, :] * same_traj_chunk  # (T, chunk_B, T)
-            
+
             # Add tiny diagonal probability
-            probs_chunk = probs_chunk + torch.eye(T, device=self.device)[:, None, :] * 1e-5
+            probs_chunk = (
+                probs_chunk + torch.eye(T, device=self.device)[:, None, :] * 1e-5
+            )
 
             log_probs_chunk = torch.log(probs_chunk)
             # Flatten for Categorical: (T * chunk_B, T)
             log_probs_flat = log_probs_chunk.reshape(T * chunk_B, T)
-            
-            goal_index_flat = torch.distributions.Categorical(logits=log_probs_flat).sample()
+
+            goal_index_flat = torch.distributions.Categorical(
+                logits=log_probs_flat
+            ).sample()
             goal_index_chunk = goal_index_flat.reshape(T, chunk_B)
             goal_indices.append(goal_index_chunk)
 
         goal_index = torch.cat(goal_indices, dim=1)  # (T, B)
 
         idx = goal_index[:-1]  # (T-1, B)
-        
+
         # Prepare a batch index for the environment dimension
-        b_idx = torch.arange(B, device=self.device)           # (B,)
-        b_idx_expanded = b_idx.unsqueeze(0).expand(T-1, B)  # (T-1, B) 
+        b_idx = torch.arange(B, device=self.device)  # (B,)
+        b_idx_expanded = b_idx.unsqueeze(0).expand(T - 1, B)  # (T-1, B)
 
         # Then gather:
-        future_state = obs[idx, b_idx_expanded]    # (T-1, B, ObsDim)
+        future_state = obs[idx, b_idx_expanded]  # (T-1, B, ObsDim)
 
         states = obs[:-1, :]  # (T-1, B, ObsDim)
         actions = actions[:-1, :]  # (T-1, B, ActDim)
-        goal = future_state  # (T-1, B, ObsDim)
+        
+        if self.goal_indices is not None:
+            goal = future_state[..., self.goal_indices] # (T-1, B, GoalDim)
+        else:
+            goal = future_state  # (T-1, B, ObsDim)
 
-        assert states.shape == goal.shape
+        assert states.shape[0] == goal.shape[0]
 
-        return states, actions, future_state
+        return states, actions, goal
 
     def make_batches(self, obs, actions, goals, batch_size):
         """
@@ -275,12 +293,12 @@ class CRL(AbstractActorCritic):
         goals:   (T-1, B, ObsDim)
         """
         Tm1, B = obs.shape[:2]
-        N = Tm1 * B    # total transitions
+        N = Tm1 * B  # total transitions
 
         # Flatten time and env dims
-        obs_flat = obs.reshape(N, -1)        # (N, ObsDim)
+        obs_flat = obs.reshape(N, -1)  # (N, ObsDim)
         actions_flat = actions.reshape(N, -1)  # (N, ActDim)
-        goals_flat = goals.reshape(N, -1)    # (N, ObsDim)
+        goals_flat = goals.reshape(N, -1)  # (N, ObsDim)
 
         # Shuffle indices
         idx = torch.randperm(N, device=obs.device)
@@ -292,11 +310,13 @@ class CRL(AbstractActorCritic):
         # Create batches
         batches = []
         for i in range(0, N, batch_size):
-            batches.append((
-                obs_flat[i : i + batch_size],
-                actions_flat[i : i + batch_size],
-                goals_flat[i : i + batch_size],
-            ))
+            batches.append(
+                (
+                    obs_flat[i : i + batch_size],
+                    actions_flat[i : i + batch_size],
+                    goals_flat[i : i + batch_size],
+                )
+            )
 
         return batches
 
@@ -310,15 +330,21 @@ class CRL(AbstractActorCritic):
         total_alpha_loss = []
         total_critic_loss = []
 
-        for trajectories in self.storage.batch_generator(batch_size=self.env.num_envs, batch_count=1):
+        for trajectories in self.storage.batch_generator(
+            batch_size=self.env.num_envs, batch_count=1
+        ):
             # break
-            obs = trajectories["actor_observations"]  # (episode_length, batch_size, ObsDim)
+            obs = trajectories[
+                "critic_observations"
+            ]  # (episode_length, batch_size, ObsDim)
             actions = trajectories["actions"]  # (episode_length, batch_size, ActDim)
             traj_ids = trajectories["traj_id"]  # (episode_length, batch_size)
 
             states, actions, goals = self.hindsight_relabel(obs, actions, traj_ids)
 
-            for b_state, b_actions, b_goals in self.make_batches(states, actions, goals, self._batch_size):
+            for b_state, b_actions, b_goals in self.make_batches(
+                states, actions, goals, self._batch_size
+            ):
 
                 # --- Update Critic (Encoders) ---
                 sa_repr = self.sa_encoder(torch.cat([b_state, b_actions], dim=-1))
@@ -330,34 +356,41 @@ class CRL(AbstractActorCritic):
                 )
 
                 self.critic_optimizer.zero_grad()
-                
+
                 crl_loss.backward()
 
-                nn.utils.clip_grad_norm_(self.sa_encoder.parameters(), self._gradient_clip)
-                nn.utils.clip_grad_norm_(self.g_encoder.parameters(), self._gradient_clip)
+                nn.utils.clip_grad_norm_(
+                    self.sa_encoder.parameters(), self._gradient_clip
+                )
+                nn.utils.clip_grad_norm_(
+                    self.g_encoder.parameters(), self._gradient_clip
+                )
                 self.critic_optimizer.step()
-                
 
                 # --- Update Actor ---
                 # actor_obs = torch.cat([b_state, b_goals], dim=-1)
                 actor_obs = torch.cat([b_state, b_goals], dim=-1)
-                new_actions, log_prob = self._sample_action(actor_obs, compute_logp=True)
-                
+                new_actions, log_prob = self._sample_action(
+                    actor_obs, compute_logp=True
+                )
+
                 sa_repr_pi = self.sa_encoder(torch.cat([b_state, new_actions], dim=-1))
                 g_repr_pi = self.g_encoder(b_goals)
-                
+
                 # Q-value (Energy)
                 qf_pi = -torch.sum((sa_repr_pi - g_repr_pi) ** 2, dim=-1)
-                
+
                 actor_loss = (self.alpha.detach() * log_prob - qf_pi).mean()
-                
+
                 self.actor_optimizer.zero_grad()
                 actor_loss.backward()
                 self.actor_optimizer.step()
-                
+
                 # --- Update Alpha ---
-                alpha_loss = (self.alpha * (-log_prob - self._target_entropy).detach()).mean()
-                
+                alpha_loss = (
+                    self.alpha * (-log_prob - self._target_entropy).detach()
+                ).mean()
+
                 self.log_alpha_optimizer.zero_grad()
                 alpha_loss.backward()
                 self.log_alpha_optimizer.step()
