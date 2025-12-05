@@ -41,17 +41,16 @@ def info_nce_loss(
 
     match version:
         case "symmetric":
-            return torch.mean(
+            return -torch.mean(
                 2 * torch.diagonal(logits)
                 - torch.logsumexp(logits, dim=1)
                 - torch.logsumexp(logits, dim=0),
             )
         case "forward":
-            return torch.mean(torch.diagonal(logits) - torch.logsumexp(logits, dim=1))
+            return -torch.mean(torch.diagonal(logits) - torch.logsumexp(logits, dim=1))
         case "forward_alt":
             labels = torch.arange(logits.size(0)).to(logits.device)
-            loss = torch.nn.functional.cross_entropy(logits, labels, reduction="mean")
-            return -loss
+            return torch.nn.functional.cross_entropy(logits, labels, reduction="mean")
         case _:
             raise ValueError(f"Unknown version: {version}")
 
@@ -83,8 +82,8 @@ class CRL(AbstractActorCritic):
         log_std_min: float = -20.0,
         target_entropy: float = None,
         logsumexp_penalty: float = 0.1,
-        chimera: bool = True,
         gamma: float = 0.99,
+        chimera: bool = False,
         **kwargs,
     ):
         super().__init__(
@@ -258,6 +257,7 @@ class CRL(AbstractActorCritic):
             goal_index_chunk = goal_index_flat.reshape(T, chunk_B)
             goal_indices.append(goal_index_chunk)
 
+        # breakpoint()
         goal_index = torch.cat(goal_indices, dim=1)  # (T, B)
 
         idx = goal_index[:-1]  # (T-1, B)
@@ -360,6 +360,11 @@ class CRL(AbstractActorCritic):
         total_alpha_loss = []
         total_critic_loss = []
 
+
+        import time
+        total_hindsight_time = 0.0
+        total_training_loop_time = 0.0
+
         for trajectories in self.storage.batch_generator(
             batch_size=self.env.num_envs, batch_count=1
         ):
@@ -370,7 +375,13 @@ class CRL(AbstractActorCritic):
             actions = trajectories["actions"]  # (episode_length, batch_size, ActDim)
             traj_ids = trajectories["traj_id"]  # (episode_length, batch_size)
 
+            t0 = time.time()
+            
             states, actions, goals = self.hindsight_relabel(obs, actions, traj_ids)
+            
+            total_hindsight_time += time.time() - t0
+            
+            t1 = time.time()
 
             for b_state, b_actions, b_goals in self.make_batches(
                 states, actions, goals, self._batch_size
@@ -381,7 +392,7 @@ class CRL(AbstractActorCritic):
                 g_repr = self.g_encoder(b_goals)
 
                 # InfoNCE Loss
-                crl_loss = -info_nce_loss(
+                crl_loss = info_nce_loss(
                     sa_repr, g_repr, temp=self.temp, version=self.crl_loss_version
                 )
 
@@ -395,16 +406,15 @@ class CRL(AbstractActorCritic):
 
                 crl_loss.backward()
 
-                nn.utils.clip_grad_norm_(
-                    self.sa_encoder.parameters(), self._gradient_clip
-                )
-                nn.utils.clip_grad_norm_(
-                    self.g_encoder.parameters(), self._gradient_clip
-                )
+                # nn.utils.clip_grad_norm_(
+                #     self.sa_encoder.parameters(), self._gradient_clip
+                # )
+                # nn.utils.clip_grad_norm_(
+                #     self.g_encoder.parameters(), self._gradient_clip
+                # )
                 self.critic_optimizer.step()
 
                 # --- Update Actor ---
-                # actor_obs = torch.cat([b_state, b_goals], dim=-1)
                 actor_obs = torch.cat([b_state, b_goals], dim=-1)
                 new_actions, log_prob = self._sample_action(
                     actor_obs, compute_logp=True
@@ -435,10 +445,14 @@ class CRL(AbstractActorCritic):
                 total_alpha_loss.append(alpha_loss.item())
                 total_critic_loss.append(crl_loss.item())
 
+            total_training_loop_time += time.time() - t1
+
         return {
             "actor": np.mean(total_actor_loss),
             "alpha": np.mean(total_alpha_loss),
             "critic": np.mean(total_critic_loss),
+            "hindsight_time": total_hindsight_time,
+            "training_loop_time": total_training_loop_time,
         }
 
     def _sample_action(self, observation, compute_logp=True):
