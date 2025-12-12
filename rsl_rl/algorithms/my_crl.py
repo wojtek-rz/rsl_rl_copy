@@ -83,7 +83,7 @@ class CRL(AbstractActorCritic):
         target_entropy: float = None,
         logsumexp_penalty: float = 0.1,
         gamma: float = 0.99,
-        chimera: bool = False,
+        chimera: bool = True,
         **kwargs,
     ):
         super().__init__(
@@ -108,7 +108,7 @@ class CRL(AbstractActorCritic):
             min_replay_size=min_replay_size,
             device=self.device,
         )
-        self._register_serializable("storage")
+        # self._register_serializable("storage")
 
         assert (
             self._action_max < np.inf
@@ -351,6 +351,7 @@ class CRL(AbstractActorCritic):
         return batches
 
     def update(self, dataset: Dataset) -> Dict[str, Union[float, torch.Tensor]]:
+
         self.storage.append(dataset)
 
         if not self.initialized:
@@ -359,11 +360,6 @@ class CRL(AbstractActorCritic):
         total_actor_loss = []
         total_alpha_loss = []
         total_critic_loss = []
-
-
-        import time
-        total_hindsight_time = 0.0
-        total_training_loop_time = 0.0
 
         for trajectories in self.storage.batch_generator(
             batch_size=self.env.num_envs, batch_count=1
@@ -375,14 +371,11 @@ class CRL(AbstractActorCritic):
             actions = trajectories["actions"]  # (episode_length, batch_size, ActDim)
             traj_ids = trajectories["traj_id"]  # (episode_length, batch_size)
 
-            t0 = time.time()
-            
+            self._bm("hindsight_relabel")
             states, actions, goals = self.hindsight_relabel(obs, actions, traj_ids)
-            
-            total_hindsight_time += time.time() - t0
-            
-            t1 = time.time()
+            self._bm("hindsight_relabel")
 
+            self._bm("training_loop")
             for b_state, b_actions, b_goals in self.make_batches(
                 states, actions, goals, self._batch_size
             ):
@@ -445,14 +438,12 @@ class CRL(AbstractActorCritic):
                 total_alpha_loss.append(alpha_loss.item())
                 total_critic_loss.append(crl_loss.item())
 
-            total_training_loop_time += time.time() - t1
+            self._bm("training_loop")
 
         return {
             "actor": np.mean(total_actor_loss),
             "alpha": np.mean(total_alpha_loss),
             "critic": np.mean(total_critic_loss),
-            "hindsight_time": total_hindsight_time,
-            "training_loop_time": total_training_loop_time,
         }
 
     def _sample_action(self, observation, compute_logp=True):

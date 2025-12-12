@@ -20,7 +20,7 @@ class ReplayBuffer():
 
     @property
     def initialized(self) -> bool:
-        return self.insert_position >= self.episode_length and self.sample_count >= self.min_replay_size
+        return  self.insert_position >= self.min_replay_size
 
     def append(self, dataset: Dataset) -> None:
         """Adds transitions to the storage.
