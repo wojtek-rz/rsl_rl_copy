@@ -38,7 +38,8 @@ class GaussianChimeraNetwork(Network):
         )
 
         # Since the network predicts log_std ~= 0 after initialization, compute std = std_init * exp(log_std).
-        self._log_std_init = np.log(std_init)
+        # Keep this as a torch buffer (not NumPy) so torch.compile / fake tensors work.
+        self.register_buffer("_log_std_init", torch.tensor(float(np.log(std_init)), dtype=torch.float32))
         self._log_std_max = log_std_max
         self._log_std_min = log_std_min
 
@@ -80,7 +81,7 @@ class GaussianChimeraNetwork(Network):
 
         # compute standard deviation as std = std_init * exp(log_std) = exp(log(std_init) + log(std)) since the network
         # will predict log_std ~= 0 after initialization.
-        log_std = (self._log_std_init + self._log_std_layer(features)).clamp(self._log_std_min, self._log_std_max)
+        log_std = (self._log_std_layer(features) + self._log_std_init).clamp(self._log_std_min, self._log_std_max)
         std = log_std.exp()
 
         return mean, std

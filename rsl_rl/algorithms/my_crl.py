@@ -154,6 +154,7 @@ class CRL(AbstractActorCritic):
             activations=["elu"] * len(g_hidden_dims) + ["linear"],
         )
 
+
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=actor_lr)
         self.log_alpha_optimizer = optim.Adam([self.log_alpha], lr=alpha_lr)
         self.critic_optimizer = optim.Adam(
@@ -318,132 +319,145 @@ class CRL(AbstractActorCritic):
 
     def make_batches(self, obs, actions, goals, batch_size):
         """
-        obs:     (T-1, B, ObsDim)
-        actions: (T-1, B, ActDim)
-        goals:   (T-1, B, ObsDim)
+        Returns all batches stacked together for compiled processing.
+        Output: (num_batches, batch_size, dim)
         """
         Tm1, B = obs.shape[:2]
-        N = Tm1 * B  # total transitions
+        N = Tm1 * B
+        
+        # Flatten
+        obs_flat = obs.reshape(N, -1)
+        actions_flat = actions.reshape(N, -1)
+        goals_flat = goals.reshape(N, -1)
 
-        # Flatten time and env dims
-        obs_flat = obs.reshape(N, -1)  # (N, ObsDim)
-        actions_flat = actions.reshape(N, -1)  # (N, ActDim)
-        goals_flat = goals.reshape(N, -1)  # (N, ObsDim)
-
-        # Shuffle indices
-        idx = torch.randperm(N, device=obs.device)
-
-        obs_flat = obs_flat[idx]
-        actions_flat = actions_flat[idx]
-        goals_flat = goals_flat[idx]
-
-        # Create batches
-        batches = []
-        for i in range(0, N, batch_size):
-            batches.append(
-                (
-                    obs_flat[i : i + batch_size],
-                    actions_flat[i : i + batch_size],
-                    goals_flat[i : i + batch_size],
-                )
+        # Reshape into batches
+        num_batches = N // batch_size
+        if num_batches == 0:
+            idx = torch.randint(0, N, (batch_size,), device=obs.device)
+            return (
+                obs_flat[idx].unsqueeze(0),
+                actions_flat[idx].unsqueeze(0),
+                goals_flat[idx].unsqueeze(0),
             )
 
-        return batches
+        # Avoid full randperm + full-tensor reindexing (costly). Sample indices directly.
+        total_size = num_batches * batch_size
+        idx = torch.randint(0, N, (total_size,), device=obs.device)
+        obs_batched = obs_flat[idx].reshape(num_batches, batch_size, -1)
+        actions_batched = actions_flat[idx].reshape(num_batches, batch_size, -1)
+        goals_batched = goals_flat[idx].reshape(num_batches, batch_size, -1)
+        
+        return obs_batched, actions_batched, goals_batched
+
+
+    def _training_step_single_batch(self, b_state, b_actions, b_goals):
+        """
+        Single training step on one batch - updates all networks sequentially.
+        This function will be called in a loop, but the loop can be JIT compiled.
+        """
+        # --- Update Critic ---
+        sa_repr = self.sa_encoder(torch.cat([b_state, b_actions], dim=-1))
+        g_repr = self.g_encoder(b_goals)
+        
+        crl_loss = info_nce_loss(
+            sa_repr, g_repr, temp=self.temp, version=self.crl_loss_version
+        )
+        
+        if self._logsumexp_penalty > 0:
+            logits = similarity_matrix(sa_repr, g_repr) / self.temp
+            logsumexp = torch.logsumexp(logits + 1e-6, dim=1)
+            crl_loss = crl_loss + self._logsumexp_penalty * torch.mean(logsumexp ** 2)
+        
+        self.critic_optimizer.zero_grad()
+        crl_loss.backward()
+        self.critic_optimizer.step()
+        
+        # --- Update Actor ---
+        actor_obs = torch.cat([b_state, b_goals], dim=-1)
+        new_actions, log_prob = self._sample_action(actor_obs, compute_logp=True)
+        
+        sa_repr_pi = self.sa_encoder(torch.cat([b_state, new_actions], dim=-1))
+        g_repr_pi = self.g_encoder(b_goals)
+        
+        qf_pi = -torch.sum((sa_repr_pi - g_repr_pi) ** 2, dim=-1)
+        actor_loss = (self.alpha.detach() * log_prob - qf_pi).mean()
+        
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
+        
+        # --- Update Alpha ---
+        alpha_loss = (self.alpha * (-log_prob - self._target_entropy).detach()).mean()
+        
+        self.log_alpha_optimizer.zero_grad()
+        alpha_loss.backward()
+        self.log_alpha_optimizer.step()
+        
+        # Return metrics (keep as tensors)
+        return {
+            'actor_loss': actor_loss.detach(),
+            'alpha_loss': alpha_loss.detach(),
+            'critic_loss': crl_loss.detach(),
+            'entropy': (-log_prob).detach().mean()
+        }
 
     def update(self, dataset: Dataset) -> Dict[str, Union[float, torch.Tensor]]:
-
         self.storage.append(dataset)
-
         if not self.initialized:
             return {}
-
+        
         total_actor_loss = []
         total_alpha_loss = []
         total_critic_loss = []
-
+        total_entropy = []
+        
         for trajectories in self.storage.batch_generator(
             batch_size=self.env.num_envs, batch_count=1
         ):
-            # break
-            obs = trajectories[
-                "critic_observations"
-            ]  # (episode_length, batch_size, ObsDim)
-            actions = trajectories["actions"]  # (episode_length, batch_size, ActDim)
-            traj_ids = trajectories["traj_id"]  # (episode_length, batch_size)
-
+            obs = trajectories["critic_observations"]
+            actions = trajectories["actions"]
+            traj_ids = trajectories["traj_id"]
+            
             self._bm("hindsight_relabel")
             states, actions, goals = self.hindsight_relabel(obs, actions, traj_ids)
             self._bm("hindsight_relabel")
-
-            self._bm("training_loop")
-            for b_state, b_actions, b_goals in self.make_batches(
+            
+            # Prepare all batches upfront (like JAX)
+            states_batched, actions_batched, goals_batched = self.make_batches(
                 states, actions, goals, self._batch_size
-            ):
-
-                # --- Update Critic (Encoders) ---
-                sa_repr = self.sa_encoder(torch.cat([b_state, b_actions], dim=-1))
-                g_repr = self.g_encoder(b_goals)
-
-                # InfoNCE Loss
-                crl_loss = info_nce_loss(
-                    sa_repr, g_repr, temp=self.temp, version=self.crl_loss_version
-                )
-
-                # Logsumexp penalty
-                if self._logsumexp_penalty > 0:
-                    logits = similarity_matrix(sa_repr, g_repr) / self.temp
-                    logsumexp = torch.logsumexp(logits + 1e-6, dim=1)
-                    crl_loss = crl_loss + self._logsumexp_penalty * torch.mean(logsumexp ** 2)
-
-                self.critic_optimizer.zero_grad()
-
-                crl_loss.backward()
-
-                # nn.utils.clip_grad_norm_(
-                #     self.sa_encoder.parameters(), self._gradient_clip
-                # )
-                # nn.utils.clip_grad_norm_(
-                #     self.g_encoder.parameters(), self._gradient_clip
-                # )
-                self.critic_optimizer.step()
-
-                # --- Update Actor ---
-                actor_obs = torch.cat([b_state, b_goals], dim=-1)
-                new_actions, log_prob = self._sample_action(
-                    actor_obs, compute_logp=True
-                )
-
-                sa_repr_pi = self.sa_encoder(torch.cat([b_state, new_actions], dim=-1))
-                g_repr_pi = self.g_encoder(b_goals)
-
-                # Q-value (Energy)
-                qf_pi = -torch.sum((sa_repr_pi - g_repr_pi) ** 2, dim=-1)
-
-                actor_loss = (self.alpha.detach() * log_prob - qf_pi).mean()
-
-                self.actor_optimizer.zero_grad()
-                actor_loss.backward()
-                self.actor_optimizer.step()
-
-                # --- Update Alpha ---
-                alpha_loss = (
-                    self.alpha * (-log_prob - self._target_entropy).detach()
-                ).mean()
-
-                self.log_alpha_optimizer.zero_grad()
-                alpha_loss.backward()
-                self.log_alpha_optimizer.step()
-
-                total_actor_loss.append(actor_loss.item())
-                total_alpha_loss.append(alpha_loss.item())
-                total_critic_loss.append(crl_loss.item())
-
+            )
+            
+            num_batches = states_batched.shape[0]
+            
             self._bm("training_loop")
-
+            
+            # Sequential processing of batches (like jax.lax.scan)
+            # Each iteration uses updated network parameters from previous iteration
+            for i in range(num_batches):
+                metrics = self._training_step_single_batch(
+                    states_batched[i],
+                    actions_batched[i],
+                    goals_batched[i]
+                )
+                
+                total_actor_loss.append(metrics['actor_loss'])
+                total_alpha_loss.append(metrics['alpha_loss'])
+                total_critic_loss.append(metrics['critic_loss'])
+                total_entropy.append(metrics['entropy'])
+            
+            self._bm("training_loop")
+        
+        def _mean_or_nan(values: list[torch.Tensor]) -> float:
+            if len(values) == 0:
+                return float("nan")
+            return torch.stack(values).mean().item()
+        
+        
         return {
-            "actor": np.mean(total_actor_loss),
-            "alpha": np.mean(total_alpha_loss),
-            "critic": np.mean(total_critic_loss),
+            "actor": _mean_or_nan(total_actor_loss),
+            "alpha": _mean_or_nan(total_alpha_loss),
+            "critic": _mean_or_nan(total_critic_loss),
+            "entropy": _mean_or_nan(total_entropy),
         }
 
     def _sample_action(self, observation, compute_logp=True):
