@@ -5,54 +5,9 @@ from typing import Any, Callable, Dict, Tuple, Union
 
 from rsl_rl.algorithms.actor_critic import AbstractActorCritic
 from rsl_rl.modules import Network, GaussianChimeraNetwork, GaussianNetwork
-from rsl_rl.storage.torch_replay_buffer import ReplayBuffer
+from rsl_rl_link.rsl_rl.storage.crl_replay_buffer import ReplayBuffer
 from rsl_rl.storage.storage import Dataset
 
-
-def similarity_matrix(sa_repr: torch.Tensor, g_repr: torch.Tensor):
-    """
-    Using L2 distance as similarity metric as per https://arxiv.org/pdf/2408.11052
-
-    Should output a (B, B) matrix where entry (i, j) is the similarity between
-    sa_repr[i] and g_repr[j].
-    """
-    batch_size = sa_repr.size(0)
-
-    diff = (sa_repr.view(batch_size, 1, -1) - g_repr.view(1, batch_size, -1)) ** 2
-
-    return -torch.sum(diff, dim=-1)  # (B, B)
-
-
-def info_nce_loss(
-    sa_repr: torch.Tensor, g_repr: torch.Tensor, temp=1, version="symmetric"
-):
-    """
-    InfoNCE loss (symmetric version)
-
-    Input
-    sa_repr: (B, D) - sa_encoder_output (questions)
-    g_repr: (B, D) - g_encoder_output (correct answers for the paired question)
-
-    sa_repr[i] is a question for which g_repr[i] is the correct answer.
-    As negative answers we use g_repr[j] for j != i .
-    """
-
-    logits = similarity_matrix(sa_repr, g_repr) / temp  # (B, B)
-
-    match version:
-        case "symmetric":
-            return -torch.mean(
-                2 * torch.diagonal(logits)
-                - torch.logsumexp(logits, dim=1)
-                - torch.logsumexp(logits, dim=0),
-            )
-        case "forward":
-            return -torch.mean(torch.diagonal(logits) - torch.logsumexp(logits, dim=1))
-        case "forward_alt":
-            labels = torch.arange(logits.size(0)).to(logits.device)
-            return torch.nn.functional.cross_entropy(logits, labels, reduction="mean")
-        case _:
-            raise ValueError(f"Unknown version: {version}")
 
 
 class CRL(AbstractActorCritic):
@@ -66,6 +21,7 @@ class CRL(AbstractActorCritic):
         episode_length: int = 1000,
         min_replay_size: int = 1000,
         max_replay_size: int = 10_000,
+        skip_size: int = 0,
         crl_loss_version: str = "symmetric",
         sa_hidden_dims: list = [256, 256],
         g_hidden_dims: list = [256, 256],
@@ -106,6 +62,7 @@ class CRL(AbstractActorCritic):
             max_replay_size=max_replay_size,  # Storage size is total transitions, we need per env
             episode_length=self.episode_length,
             min_replay_size=min_replay_size,
+            skip_size=skip_size,
             device=self.device,
         )
         # self._register_serializable("storage")
@@ -169,6 +126,21 @@ class CRL(AbstractActorCritic):
 
         # Dummy critic for AbstractActorCritic compatibility if needed
         self.critic = self.sa_encoder
+
+
+        self.similarity_matrix = torch.compile(self.similarity_matrix, mode="max-autotune")
+        self.info_nce_loss = torch.compile(self.info_nce_loss, mode="max-autotune")
+        self.critic_loss = torch.compile(self.critic_loss, mode="max-autotune")
+
+        self.sa_encoder = torch.compile(self.sa_encoder, mode="max-autotune")
+        self.g_encoder = torch.compile(self.g_encoder, mode="max-autotune")
+        self.actor = torch.compile(self.actor, mode="max-autotune")
+
+        self._training_step_single_batch = torch.compile(
+            self._training_step_single_batch,
+            mode="reduce-overhead"
+        )
+
 
     @property
     def alpha(self):
@@ -276,46 +248,6 @@ class CRL(AbstractActorCritic):
 
         return states, actions, goals
     
-    def hindsight_relabel_memory_consuming(
-        self, obs: torch.Tensor, actions: torch.Tensor, traj_ids: torch.Tensor
-    ):
-        T, B, _ = obs.shape
-        arange = torch.arange(T, device=self.device)
-        is_future_mask = (arange[:, None] < arange[None, :]).float()
-
-        discount_mat = self.gamma ** (arange[None, :] - arange[:, None]).float()  # (T, T)
-        probs = is_future_mask * discount_mat 
-
-        # Enforce same-trajectory constraint
-        same_traj = (traj_ids[:, None, :] == traj_ids[None, :, :])  # (T, T, B)
-        same_traj = same_traj.permute(0, 2, 1).float() # -> (T, B, T)
-        # Broadcast probs to per-env shape and combine with same-traj mask
-        probs = probs[:, None, :] * same_traj # (T, B, T)
-        # Add tiny diagonal probability for numerical safety
-        probs = probs + torch.eye(T, device=self.device)[:, None, :] * 1e-5
-
-        log_probs = torch.log(probs)
-        log_probs_flat = log_probs.reshape(T * B, T)
-        goal_index_flat = torch.distributions.Categorical(logits=log_probs_flat).sample()
-        goal_index = goal_index_flat.reshape(T, B)
-
-        idx = goal_index[:-1] # (T-1, B)
-
-        # Prepare a batch index for the environment dimension
-        b_idx = torch.arange(B, device=self.device)           # (B,)
-        # To use advanced indexing we need to expand b_idx to shape (T-1, B)
-        b_idx_expanded = b_idx.unsqueeze(0).expand(T-1, B)  # (T-1, B) 
-
-        # Then gather:
-        future_state = obs[idx, b_idx_expanded]    # (T-1, B, ObsDim)
-        future_action = actions[idx, b_idx_expanded]  # (T-1, B, ActDim)
-
-        states = obs[:-1, :] # (T-1, B, ObsDim)
-        actions = actions[:-1, :] # (T-1, B, ActDim)
-        goal = future_state[:, self.env.goal_indices] # (T-1, B, GoalDIm)
-
-
-        return states, actions, future_state
 
     def make_batches(self, obs, actions, goals, batch_size):
         """
@@ -348,58 +280,61 @@ class CRL(AbstractActorCritic):
         goals_batched = goals_flat[idx].reshape(num_batches, batch_size, -1)
         
         return obs_batched, actions_batched, goals_batched
-
+    
 
     def _training_step_single_batch(self, b_state, b_actions, b_goals):
         """
         Single training step on one batch - updates all networks sequentially.
         This function will be called in a loop, but the loop can be JIT compiled.
         """
-        # --- Update Critic ---
-        sa_repr = self.sa_encoder(torch.cat([b_state, b_actions], dim=-1))
         g_repr = self.g_encoder(b_goals)
-        
-        crl_loss = info_nce_loss(
-            sa_repr, g_repr, temp=self.temp, version=self.crl_loss_version
-        )
-        
-        if self._logsumexp_penalty > 0:
-            logits = similarity_matrix(sa_repr, g_repr) / self.temp
-            logsumexp = torch.logsumexp(logits + 1e-6, dim=1)
-            crl_loss = crl_loss + self._logsumexp_penalty * torch.mean(logsumexp ** 2)
-        
-        self.critic_optimizer.zero_grad()
-        crl_loss.backward()
-        self.critic_optimizer.step()
+
         
         # --- Update Actor ---
         actor_obs = torch.cat([b_state, b_goals], dim=-1)
+        
         new_actions, log_prob = self._sample_action(actor_obs, compute_logp=True)
-        
         sa_repr_pi = self.sa_encoder(torch.cat([b_state, new_actions], dim=-1))
-        g_repr_pi = self.g_encoder(b_goals)
-        
+        g_repr_pi = g_repr.detach()
         qf_pi = -torch.sum((sa_repr_pi - g_repr_pi) ** 2, dim=-1)
+
+        sa_repr_pi_spread = ((sa_repr_pi - g_repr_pi) ** 2).mean()
+        
         actor_loss = (self.alpha.detach() * log_prob - qf_pi).mean()
         
-        self.actor_optimizer.zero_grad()
+        self.actor_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
         self.actor_optimizer.step()
         
         # --- Update Alpha ---
         alpha_loss = (self.alpha * (-log_prob - self._target_entropy).detach()).mean()
         
-        self.log_alpha_optimizer.zero_grad()
+        self.log_alpha_optimizer.zero_grad(set_to_none=True)
         alpha_loss.backward()
         self.log_alpha_optimizer.step()
+
+        # --- Update Critic ---
+        sa_repr = self.sa_encoder(torch.cat([b_state, b_actions], dim=-1))
+        crl_loss, critic_aux = self.critic_loss(sa_repr, g_repr, return_aux=True)
+        categorical_accuracy, logits_pos, logits_neg, logsumexp = critic_aux
+        
+        self.critic_optimizer.zero_grad(set_to_none=True)
+        crl_loss.backward()
+        self.critic_optimizer.step()
         
         # Return metrics (keep as tensors)
         return {
             'actor_loss': actor_loss.detach(),
             'alpha_loss': alpha_loss.detach(),
             'critic_loss': crl_loss.detach(),
-            'entropy': (-log_prob).detach().mean()
+            'entropy': (-log_prob).detach().mean(),
+            'categorical_accuracy': categorical_accuracy.detach(),
+            'logits_pos': logits_pos.detach(),
+            'logits_neg': logits_neg.detach(),
+            'logsumexp': logsumexp.detach(),
+            'sa_repr_pi_spread': sa_repr_pi_spread.detach(),
         }
+    
 
     def update(self, dataset: Dataset) -> Dict[str, Union[float, torch.Tensor]]:
         self.storage.append(dataset)
@@ -410,6 +345,11 @@ class CRL(AbstractActorCritic):
         total_alpha_loss = []
         total_critic_loss = []
         total_entropy = []
+        total_categorical_accuracy = []
+        total_logits_pos = []
+        total_logits_neg = []
+        total_logsumexp = []
+        total_sa_repr_pi_spread = []
         
         for trajectories in self.storage.batch_generator(
             batch_size=self.env.num_envs, batch_count=1
@@ -440,10 +380,15 @@ class CRL(AbstractActorCritic):
                     goals_batched[i]
                 )
                 
-                total_actor_loss.append(metrics['actor_loss'])
-                total_alpha_loss.append(metrics['alpha_loss'])
-                total_critic_loss.append(metrics['critic_loss'])
-                total_entropy.append(metrics['entropy'])
+                total_actor_loss.append(metrics['actor_loss'].clone())
+                total_alpha_loss.append(metrics['alpha_loss'].clone())
+                total_critic_loss.append(metrics['critic_loss'].clone())
+                total_entropy.append(metrics['entropy'].clone())
+                total_categorical_accuracy.append(metrics['categorical_accuracy'].clone())
+                total_logits_pos.append(metrics['logits_pos'].clone())
+                total_logits_neg.append(metrics['logits_neg'].clone())
+                total_logsumexp.append(metrics['logsumexp'].clone())
+                total_sa_repr_pi_spread.append(metrics['sa_repr_pi_spread'].clone())
             
             self._bm("training_loop")
         
@@ -458,6 +403,11 @@ class CRL(AbstractActorCritic):
             "alpha": _mean_or_nan(total_alpha_loss),
             "critic": _mean_or_nan(total_critic_loss),
             "entropy": _mean_or_nan(total_entropy),
+            "categorical_accuracy": _mean_or_nan(total_categorical_accuracy),
+            "logits_pos": _mean_or_nan(total_logits_pos),
+            "logits_neg": _mean_or_nan(total_logits_neg),
+            "logsumexp": _mean_or_nan(total_logsumexp),
+            "sa_repr_pi_spread": _mean_or_nan(total_sa_repr_pi_spread),
         }
 
     def _sample_action(self, observation, compute_logp=True):
@@ -486,3 +436,71 @@ class CRL(AbstractActorCritic):
 
     def register_terminations(self, terminations):
         pass
+
+
+    def similarity_matrix(self, sa_repr: torch.Tensor, g_repr: torch.Tensor):
+        """
+        Using L2 distance as similarity metric as per https://arxiv.org/pdf/2408.11052
+
+        Should output a (B, B) matrix where entry (i, j) is the similarity between
+        sa_repr[i] and g_repr[j].
+        """
+        batch_size = sa_repr.size(0)
+
+        diff = (sa_repr.view(batch_size, 1, -1) - g_repr.view(1, batch_size, -1)) ** 2
+
+        return -torch.sum(diff, dim=-1)  # (B, B)
+
+
+    def info_nce_loss(self, logits: torch.Tensor, version: str = "symmetric"):
+        """
+        InfoNCE loss (symmetric version)
+
+        Input
+        logits: (B, B) similarities, already temperature-scaled
+
+        logits[i, j] is the similarity between question i and answer j.
+        The paired positive is (i, i); all j != i are negatives.
+        """
+
+        match version:
+            case "symmetric":
+                return -torch.mean(
+                    2 * torch.diagonal(logits)
+                    - torch.logsumexp(logits, dim=1)
+                    - torch.logsumexp(logits, dim=0),
+                )
+            case "forward":
+                return -torch.mean(torch.diagonal(logits) - torch.logsumexp(logits, dim=1))
+            case "forward_alt":
+                labels = torch.arange(logits.size(0)).to(logits.device)
+                return torch.nn.functional.cross_entropy(logits, labels, reduction="mean")
+            case _:
+                raise ValueError(f"Unknown version: {version}")
+
+
+    def critic_loss(
+        self, sa_repr: torch.Tensor, g_repr: torch.Tensor, return_aux: bool = False
+    ):
+        logits = self.similarity_matrix(sa_repr, g_repr) / self.temp
+        crl_loss = self.info_nce_loss(logits, version=self.crl_loss_version)
+
+        logsumexp = torch.logsumexp(logits + 1e-6, dim=1)
+        if self._logsumexp_penalty > 0:
+            crl_loss = crl_loss + self._logsumexp_penalty * torch.mean(logsumexp ** 2)
+
+        if not return_aux:
+            return crl_loss
+
+        batch_size = logits.size(0)
+        targets = torch.arange(batch_size, device=logits.device)
+        categorical_accuracy = (torch.argmax(logits, dim=1) == targets).float().mean()
+        logits_pos = torch.diagonal(logits).mean()
+        if batch_size > 1:
+            off_diag_mask = ~torch.eye(batch_size, dtype=torch.bool, device=logits.device)
+            logits_neg = logits[off_diag_mask].mean()
+        else:
+            logits_neg = torch.zeros((), device=logits.device, dtype=logits.dtype)
+
+        return crl_loss, (categorical_accuracy, logits_pos, logits_neg, logsumexp.mean())
+    

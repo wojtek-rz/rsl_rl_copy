@@ -1,6 +1,6 @@
 import torch
 import unittest
-from torch_replay_buffer import ReplayBuffer
+from rsl_rl_link.rsl_rl.storage.crl_replay_buffer import ReplayBuffer
 
 class TestReplayBuffer(unittest.TestCase):
     def setUp(self):
