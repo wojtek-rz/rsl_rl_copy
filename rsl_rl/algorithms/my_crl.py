@@ -287,8 +287,16 @@ class CRL(AbstractActorCritic):
         Single training step on one batch - updates all networks sequentially.
         This function will be called in a loop, but the loop can be JIT compiled.
         """
-        g_repr = self.g_encoder(b_goals)
 
+        # --- Update Critic ---
+        g_repr = self.g_encoder(b_goals)
+        sa_repr = self.sa_encoder(torch.cat([b_state, b_actions], dim=-1))
+        crl_loss, critic_aux = self.critic_loss(sa_repr, g_repr, return_aux=True)
+        categorical_accuracy, logits_pos, logits_neg, logsumexp = critic_aux
+        
+        self.critic_optimizer.zero_grad(set_to_none=True)
+        crl_loss.backward()
+        self.critic_optimizer.step()
         
         # --- Update Actor ---
         actor_obs = torch.cat([b_state, b_goals], dim=-1)
@@ -298,7 +306,8 @@ class CRL(AbstractActorCritic):
         g_repr_pi = g_repr.detach()
         qf_pi = -torch.sum((sa_repr_pi - g_repr_pi) ** 2, dim=-1)
 
-        sa_repr_pi_spread = ((sa_repr_pi - g_repr_pi) ** 2).mean()
+        with torch.no_grad():
+            sa_repr_pi_spread = ((sa_repr_pi - g_repr_pi) ** 2).mean()
         
         actor_loss = (self.alpha.detach() * log_prob - qf_pi).mean()
         
@@ -313,14 +322,6 @@ class CRL(AbstractActorCritic):
         alpha_loss.backward()
         self.log_alpha_optimizer.step()
 
-        # --- Update Critic ---
-        sa_repr = self.sa_encoder(torch.cat([b_state, b_actions], dim=-1))
-        crl_loss, critic_aux = self.critic_loss(sa_repr, g_repr, return_aux=True)
-        categorical_accuracy, logits_pos, logits_neg, logsumexp = critic_aux
-        
-        self.critic_optimizer.zero_grad(set_to_none=True)
-        crl_loss.backward()
-        self.critic_optimizer.step()
         
         # Return metrics (keep as tensors)
         return {
@@ -375,9 +376,9 @@ class CRL(AbstractActorCritic):
             # Each iteration uses updated network parameters from previous iteration
             for i in range(num_batches):
                 metrics = self._training_step_single_batch(
-                    states_batched[i],
-                    actions_batched[i],
-                    goals_batched[i]
+                    states_batched[i].detach(),
+                    actions_batched[i].detach(),
+                    goals_batched[i].detach()
                 )
                 
                 total_actor_loss.append(metrics['actor_loss'].clone())
