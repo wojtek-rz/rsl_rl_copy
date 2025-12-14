@@ -131,6 +131,9 @@ class CRL(AbstractActorCritic):
         self.similarity_matrix = torch.compile(self.similarity_matrix, mode="max-autotune")
         self.info_nce_loss = torch.compile(self.info_nce_loss, mode="max-autotune")
         self.critic_loss = torch.compile(self.critic_loss, mode="max-autotune")
+        self.critic_loss_with_additional_metrics = torch.compile(
+            self.critic_loss_with_additional_metrics, mode="max-autotune"
+        )
 
         self.sa_encoder = torch.compile(self.sa_encoder, mode="max-autotune")
         self.g_encoder = torch.compile(self.g_encoder, mode="max-autotune")
@@ -282,7 +285,7 @@ class CRL(AbstractActorCritic):
         return obs_batched, actions_batched, goals_batched
     
 
-    def _training_step_single_batch(self, b_state, b_actions, b_goals):
+    def _training_step_single_batch(self, b_state, b_actions, b_goals, critic_aux_metrics = False):
         """
         Single training step on one batch - updates all networks sequentially.
         This function will be called in a loop, but the loop can be JIT compiled.
@@ -290,13 +293,6 @@ class CRL(AbstractActorCritic):
 
         # --- Update Critic ---
         g_repr = self.g_encoder(b_goals)
-        sa_repr = self.sa_encoder(torch.cat([b_state, b_actions], dim=-1))
-        crl_loss, critic_aux = self.critic_loss(sa_repr, g_repr, return_aux=True)
-        categorical_accuracy, logits_pos, logits_neg, logsumexp = critic_aux
-        
-        self.critic_optimizer.zero_grad(set_to_none=True)
-        crl_loss.backward()
-        self.critic_optimizer.step()
         
         # --- Update Actor ---
         actor_obs = torch.cat([b_state, b_goals], dim=-1)
@@ -308,6 +304,7 @@ class CRL(AbstractActorCritic):
 
         with torch.no_grad():
             sa_repr_pi_spread = ((sa_repr_pi - g_repr_pi) ** 2).mean()
+            # additional_metrics['sa_repr_pi_spread'] = sa_repr_pi_spread.detach()
         
         actor_loss = (self.alpha.detach() * log_prob - qf_pi).mean()
         
@@ -322,6 +319,14 @@ class CRL(AbstractActorCritic):
         alpha_loss.backward()
         self.log_alpha_optimizer.step()
 
+
+        sa_repr = self.sa_encoder(torch.cat([b_state, b_actions], dim=-1))
+        crl_loss = self.critic_loss(sa_repr, g_repr)
+        
+        self.critic_optimizer.zero_grad(set_to_none=True)
+        crl_loss.backward()
+        self.critic_optimizer.step()
+
         
         # Return metrics (keep as tensors)
         return {
@@ -329,11 +334,7 @@ class CRL(AbstractActorCritic):
             'alpha_loss': alpha_loss.detach(),
             'critic_loss': crl_loss.detach(),
             'entropy': (-log_prob).detach().mean(),
-            'categorical_accuracy': categorical_accuracy.detach(),
-            'logits_pos': logits_pos.detach(),
-            'logits_neg': logits_neg.detach(),
-            'logsumexp': logsumexp.detach(),
-            'sa_repr_pi_spread': sa_repr_pi_spread.detach(),
+            # **additional_metrics
         }
     
 
@@ -378,19 +379,14 @@ class CRL(AbstractActorCritic):
                 metrics = self._training_step_single_batch(
                     states_batched[i].detach(),
                     actions_batched[i].detach(),
-                    goals_batched[i].detach()
+                    goals_batched[i].detach(),
+                    critic_aux_metrics=False,
                 )
                 
                 total_actor_loss.append(metrics['actor_loss'].clone())
                 total_alpha_loss.append(metrics['alpha_loss'].clone())
                 total_critic_loss.append(metrics['critic_loss'].clone())
                 total_entropy.append(metrics['entropy'].clone())
-                total_categorical_accuracy.append(metrics['categorical_accuracy'].clone())
-                total_logits_pos.append(metrics['logits_pos'].clone())
-                total_logits_neg.append(metrics['logits_neg'].clone())
-                total_logsumexp.append(metrics['logsumexp'].clone())
-                total_sa_repr_pi_spread.append(metrics['sa_repr_pi_spread'].clone())
-            
             self._bm("training_loop")
         
         def _mean_or_nan(values: list[torch.Tensor]) -> float:
@@ -481,7 +477,7 @@ class CRL(AbstractActorCritic):
 
 
     def critic_loss(
-        self, sa_repr: torch.Tensor, g_repr: torch.Tensor, return_aux: bool = False
+        self, sa_repr: torch.Tensor, g_repr: torch.Tensor
     ):
         logits = self.similarity_matrix(sa_repr, g_repr) / self.temp
         crl_loss = self.info_nce_loss(logits, version=self.crl_loss_version)
@@ -490,9 +486,19 @@ class CRL(AbstractActorCritic):
         if self._logsumexp_penalty > 0:
             crl_loss = crl_loss + self._logsumexp_penalty * torch.mean(logsumexp ** 2)
 
-        if not return_aux:
-            return crl_loss
+        
+        return crl_loss
 
+    def critic_loss_with_additional_metrics(
+        self, sa_repr: torch.Tensor, g_repr: torch.Tensor
+    ):
+        logits = self.similarity_matrix(sa_repr, g_repr) / self.temp
+        crl_loss = self.info_nce_loss(logits, version=self.crl_loss_version)
+
+        logsumexp = torch.logsumexp(logits + 1e-6, dim=1)
+        if self._logsumexp_penalty > 0:
+            crl_loss = crl_loss + self._logsumexp_penalty * torch.mean(logsumexp ** 2)
+        
         batch_size = logits.size(0)
         targets = torch.arange(batch_size, device=logits.device)
         categorical_accuracy = (torch.argmax(logits, dim=1) == targets).float().mean()
@@ -503,5 +509,10 @@ class CRL(AbstractActorCritic):
         else:
             logits_neg = torch.zeros((), device=logits.device, dtype=logits.dtype)
 
-        return crl_loss, (categorical_accuracy, logits_pos, logits_neg, logsumexp.mean())
+        return crl_loss, {
+            'categorical_accuracy': categorical_accuracy,
+            'logits_pos': logits_pos,
+            'logits_neg': logits_neg,
+            'logsumexp': torch.mean(logsumexp),
+        }
     
