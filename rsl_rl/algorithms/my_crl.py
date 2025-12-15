@@ -330,6 +330,52 @@ class CRL(AbstractActorCritic):
             'critic_loss': crl_loss.detach(),
             'entropy': (-log_prob).detach().mean()
         }
+    
+    def _training_step_single_batch_additionl_info(self, b_state, b_actions, b_goals):
+        """
+        Single training step on one batch - updates all networks sequentially.
+        This function will be called in a loop, but the loop can be JIT compiled.
+        """
+
+        # --- Update Critic ---
+        g_repr = self.g_encoder(b_goals)
+        sa_repr = self.sa_encoder(torch.cat([b_state, b_actions], dim=-1))
+        crl_loss, aux_info = self.critic_loss_with_additional_metrics(sa_repr, g_repr)
+        
+        self.critic_optimizer.zero_grad(set_to_none=True)
+        crl_loss.backward()
+        self.critic_optimizer.step()
+        
+        
+        # --- Update Actor ---
+        actor_obs = torch.cat([b_state, b_goals], dim=-1)
+        
+        new_actions, log_prob = self._sample_action(actor_obs, compute_logp=True)
+        sa_repr_pi = self.sa_encoder(torch.cat([b_state, new_actions], dim=-1))
+        g_repr_pi = g_repr.detach()
+        qf_pi = -torch.sum((sa_repr_pi - g_repr_pi) ** 2, dim=-1)
+        actor_loss = (self.alpha.detach() * log_prob - qf_pi).mean()
+        
+        self.actor_optimizer.zero_grad(set_to_none=True)
+        actor_loss.backward()
+        self.actor_optimizer.step()
+        
+        # --- Update Alpha ---
+        alpha_loss = (self.alpha * (-log_prob - self._target_entropy).detach()).mean()
+        
+        self.log_alpha_optimizer.zero_grad(set_to_none=True)
+        alpha_loss.backward()
+        self.log_alpha_optimizer.step()
+
+        
+        # Return metrics (keep as tensors)
+        return {
+            'actor_loss': actor_loss.detach(),
+            'alpha_loss': alpha_loss.detach(),
+            'critic_loss': crl_loss.detach(),
+            'entropy': (-log_prob).detach().mean(),
+            **aux_info,
+        }
 
     def update(self, dataset: Dataset) -> Dict[str, Union[float, torch.Tensor]]:
         self.storage.append(dataset)
