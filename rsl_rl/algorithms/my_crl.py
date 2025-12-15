@@ -285,7 +285,7 @@ class CRL(AbstractActorCritic):
         return obs_batched, actions_batched, goals_batched
     
 
-    def _training_step_single_batch(self, b_state, b_actions, b_goals, critic_aux_metrics = False):
+    def _training_step_single_batch(self, b_state, b_actions, b_goals):
         """
         Single training step on one batch - updates all networks sequentially.
         This function will be called in a loop, but the loop can be JIT compiled.
@@ -293,6 +293,13 @@ class CRL(AbstractActorCritic):
 
         # --- Update Critic ---
         g_repr = self.g_encoder(b_goals)
+        sa_repr = self.sa_encoder(torch.cat([b_state, b_actions], dim=-1))
+        crl_loss = self.critic_loss(sa_repr, g_repr)
+        
+        self.critic_optimizer.zero_grad(set_to_none=True)
+        crl_loss.backward()
+        self.critic_optimizer.step()
+        
         
         # --- Update Actor ---
         actor_obs = torch.cat([b_state, b_goals], dim=-1)
@@ -301,11 +308,6 @@ class CRL(AbstractActorCritic):
         sa_repr_pi = self.sa_encoder(torch.cat([b_state, new_actions], dim=-1))
         g_repr_pi = g_repr.detach()
         qf_pi = -torch.sum((sa_repr_pi - g_repr_pi) ** 2, dim=-1)
-
-        with torch.no_grad():
-            sa_repr_pi_spread = ((sa_repr_pi - g_repr_pi) ** 2).mean()
-            # additional_metrics['sa_repr_pi_spread'] = sa_repr_pi_spread.detach()
-        
         actor_loss = (self.alpha.detach() * log_prob - qf_pi).mean()
         
         self.actor_optimizer.zero_grad(set_to_none=True)
@@ -320,21 +322,13 @@ class CRL(AbstractActorCritic):
         self.log_alpha_optimizer.step()
 
 
-        sa_repr = self.sa_encoder(torch.cat([b_state, b_actions], dim=-1))
-        crl_loss = self.critic_loss(sa_repr, g_repr)
-        
-        self.critic_optimizer.zero_grad(set_to_none=True)
-        crl_loss.backward()
-        self.critic_optimizer.step()
-
         
         # Return metrics (keep as tensors)
         return {
             'actor_loss': actor_loss.detach(),
             'alpha_loss': alpha_loss.detach(),
             'critic_loss': crl_loss.detach(),
-            'entropy': (-log_prob).detach().mean(),
-            # **additional_metrics
+            'entropy': (-log_prob).detach().mean()
         }
     
 
@@ -379,8 +373,7 @@ class CRL(AbstractActorCritic):
                 metrics = self._training_step_single_batch(
                     states_batched[i].detach(),
                     actions_batched[i].detach(),
-                    goals_batched[i].detach(),
-                    critic_aux_metrics=False,
+                    goals_batched[i].detach()
                 )
                 
                 total_actor_loss.append(metrics['actor_loss'].clone())
