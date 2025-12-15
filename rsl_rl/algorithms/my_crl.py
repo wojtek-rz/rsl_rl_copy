@@ -330,7 +330,6 @@ class CRL(AbstractActorCritic):
             'critic_loss': crl_loss.detach(),
             'entropy': (-log_prob).detach().mean()
         }
-    
 
     def update(self, dataset: Dataset) -> Dict[str, Union[float, torch.Tensor]]:
         self.storage.append(dataset)
@@ -393,11 +392,11 @@ class CRL(AbstractActorCritic):
             "alpha": _mean_or_nan(total_alpha_loss),
             "critic": _mean_or_nan(total_critic_loss),
             "entropy": _mean_or_nan(total_entropy),
-            "categorical_accuracy": _mean_or_nan(total_categorical_accuracy),
-            "logits_pos": _mean_or_nan(total_logits_pos),
-            "logits_neg": _mean_or_nan(total_logits_neg),
-            "logsumexp": _mean_or_nan(total_logsumexp),
-            "sa_repr_pi_spread": _mean_or_nan(total_sa_repr_pi_spread),
+            # "categorical_accuracy": _mean_or_nan(total_categorical_accuracy),
+            # "logits_pos": _mean_or_nan(total_logits_pos),
+            # "logits_neg": _mean_or_nan(total_logits_neg),
+            # "logsumexp": _mean_or_nan(total_logsumexp),
+            # "sa_repr_pi_spread": _mean_or_nan(total_sa_repr_pi_spread),
         }
 
     def _sample_action(self, observation, compute_logp=True):
