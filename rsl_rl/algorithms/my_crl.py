@@ -40,6 +40,8 @@ class CRL(AbstractActorCritic):
         logsumexp_penalty: float = 0.1,
         gamma: float = 0.99,
         chimera: bool = True,
+        aux_info: bool = False,
+        torch_compile: bool = False,
         **kwargs,
     ):
         super().__init__(
@@ -56,6 +58,7 @@ class CRL(AbstractActorCritic):
         self.crl_loss_version = crl_loss_version
         self._gradient_clip = gradient_clip
         self._logsumexp_penalty = logsumexp_penalty
+        self.aux_info = aux_info
 
         self.storage = ReplayBuffer(
             num_envs=self.env.num_envs,
@@ -127,22 +130,26 @@ class CRL(AbstractActorCritic):
         # Dummy critic for AbstractActorCritic compatibility if needed
         self.critic = self.sa_encoder
 
+        if torch_compile:
+            self.similarity_matrix = torch.compile(self.similarity_matrix, mode="max-autotune")
+            self.info_nce_loss = torch.compile(self.info_nce_loss, mode="max-autotune")
+            self.critic_loss = torch.compile(self.critic_loss, mode="max-autotune")
+            self.critic_loss_with_additional_metrics = torch.compile(
+                self.critic_loss_with_additional_metrics, mode="max-autotune"
+            )
 
-        self.similarity_matrix = torch.compile(self.similarity_matrix, mode="max-autotune")
-        self.info_nce_loss = torch.compile(self.info_nce_loss, mode="max-autotune")
-        self.critic_loss = torch.compile(self.critic_loss, mode="max-autotune")
-        self.critic_loss_with_additional_metrics = torch.compile(
-            self.critic_loss_with_additional_metrics, mode="max-autotune"
-        )
+            self.sa_encoder = torch.compile(self.sa_encoder, mode="max-autotune")
+            self.g_encoder = torch.compile(self.g_encoder, mode="max-autotune")
+            self.actor = torch.compile(self.actor, mode="max-autotune")
 
-        self.sa_encoder = torch.compile(self.sa_encoder, mode="max-autotune")
-        self.g_encoder = torch.compile(self.g_encoder, mode="max-autotune")
-        self.actor = torch.compile(self.actor, mode="max-autotune")
-
-        self._training_step_single_batch = torch.compile(
-            self._training_step_single_batch,
-            mode="reduce-overhead"
-        )
+            self._training_step_single_batch = torch.compile(
+                self._training_step_single_batch,
+                mode="reduce-overhead"
+            )
+            self._training_step_single_batch_additionl_info = torch.compile(
+                self._training_step_single_batch_additionl_info,
+                mode="reduce-overhead"
+            )
 
 
     @property
@@ -353,6 +360,7 @@ class CRL(AbstractActorCritic):
         new_actions, log_prob = self._sample_action(actor_obs, compute_logp=True)
         sa_repr_pi = self.sa_encoder(torch.cat([b_state, new_actions], dim=-1))
         g_repr_pi = g_repr.detach()
+        sa_g_repr_diff = torch.mean(torch.abs(sa_repr_pi - g_repr_pi)).detach()
         qf_pi = -torch.sum((sa_repr_pi - g_repr_pi) ** 2, dim=-1)
         actor_loss = (self.alpha.detach() * log_prob - qf_pi).mean()
         
@@ -374,6 +382,7 @@ class CRL(AbstractActorCritic):
             'alpha_loss': alpha_loss.detach(),
             'critic_loss': crl_loss.detach(),
             'entropy': (-log_prob).detach().mean(),
+            'sa_g_repr_diff': sa_g_repr_diff,
             **aux_info,
         }
 
@@ -390,7 +399,7 @@ class CRL(AbstractActorCritic):
         total_logits_pos = []
         total_logits_neg = []
         total_logsumexp = []
-        total_sa_repr_pi_spread = []
+        sa_g_repr_diff = []
         
         for trajectories in self.storage.batch_generator(
             batch_size=self.env.num_envs, batch_count=1
@@ -415,11 +424,24 @@ class CRL(AbstractActorCritic):
             # Sequential processing of batches (like jax.lax.scan)
             # Each iteration uses updated network parameters from previous iteration
             for i in range(num_batches):
-                metrics = self._training_step_single_batch(
-                    states_batched[i].detach(),
-                    actions_batched[i].detach(),
-                    goals_batched[i].detach()
-                )
+                
+                if not self.aux_info:
+                    metrics = self._training_step_single_batch(
+                        states_batched[i].detach(),
+                        actions_batched[i].detach(),
+                        goals_batched[i].detach()
+                    )
+                if self.aux_info:
+                    metrics = self._training_step_single_batch_additionl_info(
+                        states_batched[i].detach(),
+                        actions_batched[i].detach(),
+                        goals_batched[i].detach()
+                    )
+                    total_categorical_accuracy.append(metrics['categorical_accuracy'].clone())
+                    total_logits_pos.append(metrics['logits_pos'].clone())
+                    total_logits_neg.append(metrics['logits_neg'].clone())
+                    total_logsumexp.append(metrics['logsumexp'].clone())
+                    sa_g_repr_diff.append(metrics['sa_g_repr_diff'].clone())
                 
                 total_actor_loss.append(metrics['actor_loss'].clone())
                 total_alpha_loss.append(metrics['alpha_loss'].clone())
@@ -432,18 +454,26 @@ class CRL(AbstractActorCritic):
                 return float("nan")
             return torch.stack(values).mean().item()
         
-        
-        return {
-            "actor": _mean_or_nan(total_actor_loss),
-            "alpha": _mean_or_nan(total_alpha_loss),
-            "critic": _mean_or_nan(total_critic_loss),
-            "entropy": _mean_or_nan(total_entropy),
-            # "categorical_accuracy": _mean_or_nan(total_categorical_accuracy),
-            # "logits_pos": _mean_or_nan(total_logits_pos),
-            # "logits_neg": _mean_or_nan(total_logits_neg),
-            # "logsumexp": _mean_or_nan(total_logsumexp),
-            # "sa_repr_pi_spread": _mean_or_nan(total_sa_repr_pi_spread),
-        }
+
+        if not self.aux_info:
+            return {
+                "actor": _mean_or_nan(total_actor_loss),
+                "alpha": _mean_or_nan(total_alpha_loss),
+                "critic": _mean_or_nan(total_critic_loss),
+                "entropy": _mean_or_nan(total_entropy),
+            }
+        else:
+            return {
+                "actor": _mean_or_nan(total_actor_loss),
+                "alpha": _mean_or_nan(total_alpha_loss),
+                "critic": _mean_or_nan(total_critic_loss),
+                "entropy": _mean_or_nan(total_entropy),
+                "categorical_accuracy": _mean_or_nan(total_categorical_accuracy),
+                "logits_pos": _mean_or_nan(total_logits_pos),
+                "logits_neg": _mean_or_nan(total_logits_neg),
+                "logsumexp": _mean_or_nan(total_logsumexp),
+                "sa_g_repr_diff": _mean_or_nan(sa_g_repr_diff),
+            }
 
     def _sample_action(self, observation, compute_logp=True):
         mean, std = self.actor.forward(observation, compute_std=True)
@@ -548,9 +578,9 @@ class CRL(AbstractActorCritic):
             logits_neg = torch.zeros((), device=logits.device, dtype=logits.dtype)
 
         return crl_loss, {
-            'categorical_accuracy': categorical_accuracy,
-            'logits_pos': logits_pos,
-            'logits_neg': logits_neg,
-            'logsumexp': torch.mean(logsumexp),
+            'categorical_accuracy': categorical_accuracy.detach(),
+            'logits_pos': logits_pos.detach(),
+            'logits_neg': logits_neg.detach(),
+            'logsumexp': torch.mean(logsumexp).detach()
         }
     
