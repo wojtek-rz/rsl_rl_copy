@@ -5,7 +5,7 @@ from typing import Any, Callable, Dict, Tuple, Union
 
 from rsl_rl.algorithms.actor_critic import AbstractActorCritic
 from rsl_rl.modules import Network, GaussianChimeraNetwork, GaussianNetwork
-from rsl_rl_link.rsl_rl.storage.crl_replay_buffer import ReplayBuffer
+from rsl_rl.rsl_rl.storage.crl_replay_buffer import ReplayBuffer
 from rsl_rl.storage.storage import Dataset
 
 
