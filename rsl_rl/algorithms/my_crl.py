@@ -8,6 +8,91 @@ from rsl_rl.modules import Network, GaussianChimeraNetwork, GaussianNetwork
 from rsl_rl.storage.crl_replay_buffer import ReplayBuffer
 from rsl_rl.storage.storage import Dataset
 
+def lecun_uniform_init(layer):
+    fan_in, _ = nn.init._calculate_fan_in_and_fan_out(layer.weight)
+    limit = np.sqrt(1  / fan_in)
+    nn.init.uniform_(layer.weight, -limit, limit)
+    if layer.bias is not None:
+        nn.init.zeros_(layer.bias)
+
+
+class Encoder(nn.Module):
+    def __init__(
+        self,
+        input_size: int,
+        repr_dim: int = 64,
+        hidden_dims: list = [256, 256]
+    ):
+        super().__init__()
+        self.repr_dim = repr_dim
+        self.hidden_dims = hidden_dims
+
+        self.layers = nn.ModuleList()
+        self.activation = torch.nn.functional.silu
+        
+        curr_dim = input_size
+
+        for hidden_dim in hidden_dims:
+            layer = nn.Linear(curr_dim, hidden_dim)
+            lecun_uniform_init(layer)
+            self.layers.append(layer)
+            curr_dim = hidden_dim
+
+        self.output_layer = nn.Linear(curr_dim, repr_dim)
+        lecun_uniform_init(self.output_layer)
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+            x = self.activation(x)
+        
+        x = self.output_layer(x)
+        return x
+
+
+class Actor(nn.Module):
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        hidden_dims: list,
+        log_std_max: float,
+        log_std_min: float,
+    ):
+        super().__init__()
+        self.output_size = output_size
+        self.hidden_dims = hidden_dims
+        self.log_std_max = log_std_max
+        self.log_std_min = log_std_min
+
+        self.layers = nn.ModuleList()
+        self.activation = torch.nn.functional.silu
+        
+        curr_dim = input_size
+        for hidden_dim in hidden_dims:
+            layer = nn.Linear(curr_dim, hidden_dim)
+            lecun_uniform_init(layer)
+            self.layers.append(layer)
+            curr_dim = hidden_dim
+
+        self.mean_layer = nn.Linear(curr_dim, output_size)
+        lecun_uniform_init(self.mean_layer)
+        
+        self.log_std_layer = nn.Linear(curr_dim, output_size)
+        lecun_uniform_init(self.log_std_layer)
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+            x = self.activation(x)
+        
+        mean = self.mean_layer(x)
+        log_std = self.log_std_layer(x)
+        
+        log_std_normalized = torch.tanh(log_std)
+        log_std_scaled = self.log_std_min + 0.5 * (self.log_std_max - self.log_std_min) * (log_std_normalized + 1)
+        std = log_std_scaled.exp()
+        return mean, std
 
 
 class CRL(AbstractActorCritic):
@@ -87,31 +172,28 @@ class CRL(AbstractActorCritic):
         self._register_serializable("log_alpha", "_gradient_clip")
 
         # Actor Network
-        network_class = GaussianChimeraNetwork if chimera else GaussianNetwork
-        self.actor = network_class(
+        # network_class = GaussianChimeraNetwork if chimera else GaussianNetwork
+        self.actor = Actor(
             self._actor_input_size,
             self._action_size,
             log_std_max=log_std_max,
             log_std_min=log_std_min,
-            std_init=actor_noise_std,
-            **self._actor_network_kwargs,
+            hidden_dims=kwargs['actor_hidden_dims']
         )
 
         # Encoders (Critic)
         print(f"{self._critic_input_size=}, {self._actor_input_size=}")
 
-        self.sa_encoder = Network(
+        self.sa_encoder = Encoder(
             self._critic_input_size,
             self.repr_dim,
-            hidden_dims=sa_hidden_dims,
-            activations=["elu"] * len(sa_hidden_dims) + ["linear"],
+            hidden_dims=sa_hidden_dims
         )
 
-        self.g_encoder = Network(
+        self.g_encoder = Encoder(
             goal_dim,
             self.repr_dim,
-            hidden_dims=g_hidden_dims,
-            activations=["elu"] * len(g_hidden_dims) + ["linear"],
+            hidden_dims=g_hidden_dims
         )
 
 
@@ -161,7 +243,7 @@ class CRL(AbstractActorCritic):
     ) -> Tuple[torch.Tensor, Union[Dict[str, torch.Tensor], None]]:
         # breakpoint()
         actor_obs, critic_obs = self._process_observations(obs, env_info)
-        action = self._sample_action(actor_obs, compute_logp=False)
+        action = self._sample_action(actor_obs)
         data = {
             "actor_observations": actor_obs.clone(),
             "critic_observations": critic_obs.clone(),
@@ -174,7 +256,7 @@ class CRL(AbstractActorCritic):
 
         def policy(obs, env_info=None):
             obs, _ = self._process_observations(obs, env_info)
-            actions = self._scale_actions(self.actor.forward(obs))
+            actions = self._sample_action_inference(obs)
             return actions
 
         return policy
@@ -311,7 +393,7 @@ class CRL(AbstractActorCritic):
         # --- Update Actor ---
         actor_obs = torch.cat([b_state, b_goals], dim=-1)
         
-        new_actions, log_prob = self._sample_action(actor_obs, compute_logp=True)
+        new_actions, log_prob = self._sample_action_logp(actor_obs)
         sa_repr_pi = self.sa_encoder(torch.cat([b_state, new_actions], dim=-1))
         g_repr_pi = g_repr.detach()
         qf_pi = -torch.sum((sa_repr_pi - g_repr_pi) ** 2, dim=-1)
@@ -357,7 +439,7 @@ class CRL(AbstractActorCritic):
         # --- Update Actor ---
         actor_obs = torch.cat([b_state, b_goals], dim=-1)
         
-        new_actions, log_prob = self._sample_action(actor_obs, compute_logp=True)
+        new_actions, log_prob = self._sample_action_logp(actor_obs)
         sa_repr_pi = self.sa_encoder(torch.cat([b_state, new_actions], dim=-1))
         g_repr_pi = g_repr.detach()
         sa_g_repr_diff = torch.mean(torch.abs(sa_repr_pi - g_repr_pi)).detach()
@@ -475,29 +557,30 @@ class CRL(AbstractActorCritic):
                 "sa_g_repr_diff": _mean_or_nan(sa_g_repr_diff),
             }
 
-    def _sample_action(self, observation, compute_logp=True):
-        mean, std = self.actor.forward(observation, compute_std=True)
+    def _sample_action_logp(self, observation):
+        mean, std = self.actor.forward(observation)
         dist = torch.distributions.Normal(mean, std)
         actions = dist.rsample()
-        actions_normalized, actions_scaled = self._scale_actions(
-            actions, intermediate=True
-        )
-
-        if not compute_logp:
-            return actions_scaled
+        actions_normalized = torch.tanh(actions)
 
         action_logp = dist.log_prob(actions).sum(-1) - torch.log(
             1.0 - actions_normalized.pow(2) + 1e-6
         ).sum(-1)
-        return actions_scaled, action_logp
+        return actions_normalized, action_logp
 
-    def _scale_actions(self, actions, intermediate=False):
-        actions = actions.reshape(-1, self._action_size)
-        action_normalized = torch.tanh(actions)
-        action_scaled = action_normalized * self._action_delta + self._action_offset
-        if intermediate:
-            return action_normalized, action_scaled
-        return action_scaled
+    def _sample_action(self, observation):
+        mean, std = self.actor.forward(observation)
+        dist = torch.distributions.Normal(mean, std)
+        actions = dist.rsample()
+        actions_normalized = torch.tanh(actions)
+
+        return actions_normalized
+
+    def _sample_action_inference(self, observation):
+        mean, std = self.actor.forward(observation)
+        actions_normalized = torch.tanh(mean)
+
+        return actions_normalized
 
     def register_terminations(self, terminations):
         pass
