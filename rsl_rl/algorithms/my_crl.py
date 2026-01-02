@@ -232,6 +232,12 @@ class CRL(AbstractActorCritic):
                 self._training_step_single_batch_additionl_info,
                 mode="reduce-overhead"
             )
+            self._sample_action_logp = torch.compile(
+                self._sample_action_logp
+            )
+            self._sample_action = torch.compile(
+                self._sample_action
+            )
 
 
     @property
@@ -568,7 +574,6 @@ class CRL(AbstractActorCritic):
                 "sa_g_repr_diff": _mean_or_nan(sa_g_repr_diff),
             }
 
-    @torch.compile()
     def _sample_action_logp(self, observation):
         mean, std = self.actor.forward(observation)
         dist = torch.distributions.Normal(mean, std)
@@ -580,7 +585,6 @@ class CRL(AbstractActorCritic):
         ).sum(-1)
         return actions_normalized, action_logp
     
-    @torch.compile()
     def _sample_action(self, observation):
         mean, std = self.actor.forward(observation)
         eps = torch.randn_like(std)
