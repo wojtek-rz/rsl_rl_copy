@@ -250,6 +250,11 @@ class CRL(AbstractActorCritic):
         }
         return action, data
 
+    def draw_random_actions(
+        self, obs: torch.Tensor, env_info: Dict[str, Any]
+    ) -> Tuple[torch.Tensor, Union[Dict[str, torch.Tensor], None]]:
+        return self.draw_actions(obs, env_info)
+
     def get_inference_policy(self, device=None) -> Callable:
         self.to(device)
         self.eval_mode()
