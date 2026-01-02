@@ -396,11 +396,21 @@ class CRL(AbstractActorCritic):
         
         
         # --- Update Actor ---
-        actor_obs = torch.cat([b_state, b_goals], dim=-1)
+        B = b_state.size(0)
+        # shift half of the goals to encourage exploration
+        to_shift = B // 2
+        goal_perm = torch.randperm(to_shift)
+        b_goals_shifted = b_goals.clone()
+        g_repr_shifted = g_repr.clone()
+        
+        b_goals_shifted[:to_shift] = torch.roll(b_goals[:to_shift], shifts=1, dims=0)
+        g_repr_shifted[:to_shift] = torch.roll(g_repr[:to_shift], shifts=1, dims=0)
+
+        actor_obs = torch.cat([b_state, b_goals_shifted], dim=-1)
         
         new_actions, log_prob = self._sample_action_logp(actor_obs)
         sa_repr_pi = self.sa_encoder(torch.cat([b_state, new_actions], dim=-1))
-        g_repr_pi = g_repr.detach()
+        g_repr_pi = g_repr_shifted.detach()
         qf_pi = -torch.sum((sa_repr_pi - g_repr_pi) ** 2, dim=-1)
         actor_loss = (self.alpha.detach() * log_prob - qf_pi).mean()
         
