@@ -253,7 +253,9 @@ class CRL(AbstractActorCritic):
     def draw_random_actions(
         self, obs: torch.Tensor, env_info: Dict[str, Any]
     ) -> Tuple[torch.Tensor, Union[Dict[str, torch.Tensor], None]]:
-        return self.draw_actions(obs, env_info)
+        with torch.no_grad():
+            actions = self._sample_action(obs)
+        return actions.clone(), {}
 
     def get_inference_policy(self, device=None) -> Callable:
         self.to(device)
@@ -474,7 +476,9 @@ class CRL(AbstractActorCritic):
         }
 
     def update(self, dataset: Dataset) -> Dict[str, Union[float, torch.Tensor]]:
+        self._bm("store_to_buffer")
         self.storage.append(dataset)
+        self._bm("store_to_buffer")
         if not self.initialized:
             return {}
         
@@ -488,9 +492,11 @@ class CRL(AbstractActorCritic):
         total_logsumexp = []
         sa_g_repr_diff = []
         
+        self._bm("sampling_from_buffer")
         for trajectories in self.storage.batch_generator(
             batch_size=self.env.num_envs, batch_count=1
         ):
+            self._bm("sampling_from_buffer")
             obs = trajectories["critic_observations"]
             actions = trajectories["actions"]
             traj_ids = trajectories["traj_id"]
@@ -562,6 +568,7 @@ class CRL(AbstractActorCritic):
                 "sa_g_repr_diff": _mean_or_nan(sa_g_repr_diff),
             }
 
+    @torch.compile()
     def _sample_action_logp(self, observation):
         mean, std = self.actor.forward(observation)
         dist = torch.distributions.Normal(mean, std)
@@ -572,11 +579,12 @@ class CRL(AbstractActorCritic):
             1.0 - actions_normalized.pow(2) + 1e-6
         ).sum(-1)
         return actions_normalized, action_logp
-
+    
+    @torch.compile()
     def _sample_action(self, observation):
         mean, std = self.actor.forward(observation)
-        dist = torch.distributions.Normal(mean, std)
-        actions = dist.rsample()
+        eps = torch.randn_like(std)
+        actions = mean + std * eps   
         actions_normalized = torch.tanh(actions)
 
         return actions_normalized
